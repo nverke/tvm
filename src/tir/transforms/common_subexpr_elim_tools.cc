@@ -434,9 +434,9 @@ void ComputationsDoneBy::VisitStmt_(const IfThenElseNode* op) {
   table_of_computations_.clear();
 
   ComputationTable computations_done_by_else;
-  if (op->else_case.defined()) {
-    // And finally calls the VisitStmt() method on the `then_case` child
-    VisitStmt(op->else_case);
+  if (op->else_case) {
+    // And finally calls the VisitStmt() method on the `else_case` child
+    VisitStmt(op->else_case.value());
     computations_done_by_else = table_of_computations_;
     table_of_computations_.clear();
   }
@@ -866,7 +866,7 @@ std::vector<std::pair<PrimExpr, size_t>> SyntacticToSemanticComputations(
 bool PredicateIntroVarForComputation(const PrimExpr& computation, size_t nb_times_seen) {
   // This predicate could later implement something more fine grained that would take in account
   // the size of the expression too, as for instance a very large computation could be introduced
-  // as soon as two occurences are seen, but a smaller one could need three or more occurences
+  // as soon as two occurrences are seen, but a smaller one could need three or more occurrences
   // for being introduced in a variable.
 
   // But for now, we factorize any eligible item that we see at least twice, regardless of its size

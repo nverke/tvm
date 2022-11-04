@@ -45,18 +45,20 @@
 // 'python3 jenkins/generate.py'
 // Note: This timestamp is here to ensure that updates to the Jenkinsfile are
 // always rebased on main before merging:
-// Generated at 2022-08-01T14:23:41.853298
+// Generated at 2022-10-19T13:44:32.119961
 
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 // NOTE: these lines are scanned by docker/dev_common.sh. Please update the regex as needed. -->
-ci_lint = 'tlcpack/ci-lint:20220715-060127-37f9d3c49'
-ci_gpu = 'tlcpack/ci-gpu:20220801-060139-d332eb374'
-ci_cpu = 'tlcpack/ci-cpu:20220715-060127-37f9d3c49'
-ci_wasm = 'tlcpack/ci-wasm:20220715-060127-37f9d3c49'
-ci_i386 = 'tlcpack/ci-i386:20220715-060127-37f9d3c49'
-ci_qemu = 'tlcpack/ci-qemu:20220630-060117-558ba99c7'
-ci_arm = 'tlcpack/ci-arm:20220715-060127-37f9d3c49'
-ci_hexagon = 'tlcpack/ci-hexagon:20220715-060127-37f9d3c49'
+ci_lint = 'tlcpack/ci-lint:20221025-182121-e41d0ed6e'
+ci_gpu = 'tlcpack/ci-gpu:20221025-182121-e41d0ed6e'
+ci_cpu = 'tlcpack/ci-cpu:20221025-182121-e41d0ed6e'
+ci_minimal = 'tlcpack/ci-minimal:20221025-182121-e41d0ed6e'
+ci_wasm = 'tlcpack/ci-wasm:20221025-182121-e41d0ed6e'
+ci_i386 = 'tlcpack/ci-i386:20221025-182121-e41d0ed6e'
+ci_cortexm = 'tlcpack/ci-cortexm:20221025-182121-e41d0ed6e'
+ci_arm = 'tlcpack/ci-arm:20221025-182121-e41d0ed6e'
+ci_hexagon = 'tlcpack/ci-hexagon:20221025-182121-e41d0ed6e'
+ci_riscv = 'tlcpack/ci-riscv:20221025-182121-e41d0ed6e'
 // <--- End of regex-scanned config.
 
 // Parameters to allow overriding (in Jenkins UI), the images
@@ -65,22 +67,37 @@ ci_hexagon = 'tlcpack/ci-hexagon:20220715-060127-37f9d3c49'
 properties([
   parameters([
     string(name: 'ci_arm_param', defaultValue: ''),
+    string(name: 'ci_cortexm_param', defaultValue: ''),
     string(name: 'ci_cpu_param', defaultValue: ''),
     string(name: 'ci_gpu_param', defaultValue: ''),
     string(name: 'ci_hexagon_param', defaultValue: ''),
     string(name: 'ci_i386_param', defaultValue: ''),
     string(name: 'ci_lint_param', defaultValue: ''),
-    string(name: 'ci_qemu_param', defaultValue: ''),
+    string(name: 'ci_minimal_param', defaultValue: ''),
+    string(name: 'ci_riscv_param', defaultValue: ''),
     string(name: 'ci_wasm_param', defaultValue: ''),
   ])
 ])
+
+// Placeholders for newly built Docker image names (if rebuild_docker_images
+// is used)
+  built_ci_arm = null;
+  built_ci_cortexm = null;
+  built_ci_cpu = null;
+  built_ci_gpu = null;
+  built_ci_hexagon = null;
+  built_ci_i386 = null;
+  built_ci_lint = null;
+  built_ci_minimal = null;
+  built_ci_riscv = null;
+  built_ci_wasm = null;
 
 // Global variable assigned during Sanity Check that holds the sha1 which should be
 // merged into the PR in all branches.
 upstream_revision = null
 
 // command to start a docker container
-docker_run = 'docker/bash.sh --env CI --env TVM_SHARD_INDEX --env TVM_NUM_SHARDS --env RUN_DISPLAY_URL --env PLATFORM'
+docker_run = 'docker/bash.sh --env CI --env TVM_SHARD_INDEX --env TVM_NUM_SHARDS --env RUN_DISPLAY_URL --env PLATFORM --env SKIP_SLOW_TESTS --env TEST_STEP_NAME'
 docker_build = 'docker/build.sh'
 // timeout in minutes
 max_time = 180
@@ -99,8 +116,9 @@ def per_exec_ws(folder) {
 
 // initialize source codes
 def init_git() {
-  checkout scm
-
+  retry(5) {
+    checkout scm
+  }
 
   // Add more info about job node
   sh (
@@ -126,27 +144,14 @@ def init_git() {
   )
 
   sh(
-    script: '''
+    script: """
       set -eux
-      n=0
-      max_retries=3
-      backoff_max=30
-      until [ "$n" -ge $max_retries ]
-      do
-          timeout 5m git submodule update --init -f --jobs 0 && break
-          n=$((n+1))
-          if [ "$n" -eq $max_retries ]; then
-              echo "failed to update $n / $max_retries, giving up"
-              exit 1
-          fi
-
-          WAIT=$((RANDOM % "$backoff_max"))
-          echo "failed to update $n / $max_retries, waiting $WAIT to try again"
-          sleep $WAIT
-      done
-    ''',
+      . ci/scripts/retry.sh
+      retry 3 timeout 5m git submodule update --init -f --jobs 0
+    """,
     label: 'Update git submodules',
   )
+  checkout_trusted_files()
 }
 
 def docker_init(image) {
@@ -171,7 +176,11 @@ def docker_init(image) {
     ecr_pull(image)
   } else {
     sh(
-      script: "docker pull ${image}",
+      script: """
+      set -eux
+      . ci/scripts/retry.sh
+      retry 5 docker pull ${image}
+      """,
       label: 'Pull docker image',
     )
   }
@@ -185,7 +194,7 @@ def should_skip_slow_tests(pr_number) {
     // Exit code of 1 means run slow tests, exit code of 0 means skip slow tests
     result = sh (
       returnStatus: true,
-      script: "./tests/scripts/should_run_slow_tests.py --pr '${pr_number}'",
+      script: "./ci/scripts/should_run_slow_tests.py --pr '${pr_number}'",
       label: 'Check if CI should run slow tests',
     )
   }
@@ -203,6 +212,30 @@ def cancel_previous_build() {
   }
 }
 
+def checkout_trusted_files() {
+  // trust everything from branch builds
+  if (env.BRANCH_NAME == null || !env.BRANCH_NAME.startsWith('PR-')) {
+    return;
+  }
+
+  // trust peoople listed in CONTRIBUTING.md
+  grep_code = sh(
+    returnStatus: true,
+    script: "git show '${upstream_revision}:CONTRIBUTORS.md' | grep '@${env.CHANGE_AUTHOR}'",
+    label: 'Check if change is from a contributor',
+  )
+
+  if (grep_code == 1) {
+    // Any scripts that run on the bare host and not inside a Docker container
+    // (especially those that access secrets) should be checked out here so
+    // only trusted versions are used in CI
+    sh(
+      script: "git checkout ${upstream_revision} ci/scripts/.",
+      label: 'Check out trusted files',
+    )
+  }
+}
+
 def should_skip_ci(pr_number) {
   if (env.BRANCH_NAME == null || !env.BRANCH_NAME.startsWith('PR-')) {
     // never skip CI on build sourced from a branch
@@ -210,7 +243,7 @@ def should_skip_ci(pr_number) {
   }
   glob_skip_ci_code = sh (
     returnStatus: true,
-    script: "./tests/scripts/git_skip_ci_globs.py",
+    script: "./ci/scripts/git_skip_ci_globs.py",
     label: 'Check if CI should be skipped due to changed files',
   )
   if (glob_skip_ci_code == 0) {
@@ -218,17 +251,34 @@ def should_skip_ci(pr_number) {
   }
   withCredentials([string(
     credentialsId: 'tvm-bot-jenkins-reader',
-    variable: 'TOKEN',
+    variable: 'GITHUB_TOKEN',
     )]) {
     // Exit code of 1 means run full CI (or the script had an error, so run
     // full CI just in case). Exit code of 0 means skip CI.
     git_skip_ci_code = sh (
       returnStatus: true,
-      script: "./tests/scripts/git_skip_ci.py --pr '${pr_number}'",
+      script: "./ci/scripts/git_skip_ci.py --pr '${pr_number}'",
       label: 'Check if CI should be skipped',
     )
   }
   return git_skip_ci_code == 0
+}
+
+def check_pr(pr_number) {
+  if (env.BRANCH_NAME == null || !env.BRANCH_NAME.startsWith('PR-')) {
+    // never skip CI on build sourced from a branch
+    return false
+  }
+  withCredentials([string(
+    credentialsId: 'tvm-bot-jenkins-reader',
+    variable: 'GITHUB_TOKEN',
+    )]) {
+    sh (
+      script: "python3 ci/scripts/check_pr.py --pr ${pr_number}",
+      label: 'Check PR title and body',
+    )
+  }
+
 }
 
 def prepare() {
@@ -237,15 +287,22 @@ def prepare() {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/prepare") {
         init_git()
 
+        check_pr(env.CHANGE_ID)
+
         if (env.DETERMINE_DOCKER_IMAGES == 'yes') {
           sh(
-            script: "./tests/scripts/determine_docker_images.py ci_arm=${ci_arm} ci_cpu=${ci_cpu} ci_gpu=${ci_gpu} ci_hexagon=${ci_hexagon} ci_i386=${ci_i386} ci_lint=${ci_lint} ci_qemu=${ci_qemu} ci_wasm=${ci_wasm} ",
+            script: "./ci/scripts/determine_docker_images.py ci_arm=${ci_arm} ci_cortexm=${ci_cortexm} ci_cpu=${ci_cpu} ci_gpu=${ci_gpu} ci_hexagon=${ci_hexagon} ci_i386=${ci_i386} ci_lint=${ci_lint} ci_minimal=${ci_minimal} ci_riscv=${ci_riscv} ci_wasm=${ci_wasm} ",
             label: 'Decide whether to use tlcpack or tlcpackstaging for Docker images',
           )
           // Pull image names from the results of should_rebuild_docker.py
           ci_arm = sh(
             script: "cat .docker-image-names/ci_arm",
             label: "Find docker image name for ci_arm",
+            returnStdout: true,
+          ).trim()
+          ci_cortexm = sh(
+            script: "cat .docker-image-names/ci_cortexm",
+            label: "Find docker image name for ci_cortexm",
             returnStdout: true,
           ).trim()
           ci_cpu = sh(
@@ -273,9 +330,14 @@ def prepare() {
             label: "Find docker image name for ci_lint",
             returnStdout: true,
           ).trim()
-          ci_qemu = sh(
-            script: "cat .docker-image-names/ci_qemu",
-            label: "Find docker image name for ci_qemu",
+          ci_minimal = sh(
+            script: "cat .docker-image-names/ci_minimal",
+            label: "Find docker image name for ci_minimal",
+            returnStdout: true,
+          ).trim()
+          ci_riscv = sh(
+            script: "cat .docker-image-names/ci_riscv",
+            label: "Find docker image name for ci_riscv",
             returnStdout: true,
           ).trim()
           ci_wasm = sh(
@@ -286,38 +348,43 @@ def prepare() {
         }
 
         ci_arm = params.ci_arm_param ?: ci_arm
+        ci_cortexm = params.ci_cortexm_param ?: ci_cortexm
         ci_cpu = params.ci_cpu_param ?: ci_cpu
         ci_gpu = params.ci_gpu_param ?: ci_gpu
         ci_hexagon = params.ci_hexagon_param ?: ci_hexagon
         ci_i386 = params.ci_i386_param ?: ci_i386
         ci_lint = params.ci_lint_param ?: ci_lint
-        ci_qemu = params.ci_qemu_param ?: ci_qemu
+        ci_minimal = params.ci_minimal_param ?: ci_minimal
+        ci_riscv = params.ci_riscv_param ?: ci_riscv
         ci_wasm = params.ci_wasm_param ?: ci_wasm
 
         sh (script: """
           echo "Docker images being used in this build:"
           echo " ci_arm = ${ci_arm}"
+          echo " ci_cortexm = ${ci_cortexm}"
           echo " ci_cpu = ${ci_cpu}"
           echo " ci_gpu = ${ci_gpu}"
           echo " ci_hexagon = ${ci_hexagon}"
           echo " ci_i386 = ${ci_i386}"
           echo " ci_lint = ${ci_lint}"
-          echo " ci_qemu = ${ci_qemu}"
+          echo " ci_minimal = ${ci_minimal}"
+          echo " ci_riscv = ${ci_riscv}"
           echo " ci_wasm = ${ci_wasm}"
         """, label: 'Docker image names')
 
         is_docs_only_build = sh (
           returnStatus: true,
-          script: './tests/scripts/git_change_docs.sh',
+          script: './ci/scripts/git_change_docs.sh',
           label: 'Check for docs only changes',
         )
         skip_ci = should_skip_ci(env.CHANGE_ID)
         skip_slow_tests = should_skip_slow_tests(env.CHANGE_ID)
         rebuild_docker_images = sh (
           returnStatus: true,
-          script: './tests/scripts/git_change_docker.sh',
+          script: './ci/scripts/git_change_docker.sh',
           label: 'Check for any docker changes',
         )
+
         if (skip_ci) {
           // Don't rebuild when skipping CI
           rebuild_docker_images = false
@@ -349,8 +416,9 @@ def ecr_push(full_name) {
       sh(
         script: """
           set -x
+          . ci/scripts/retry.sh
           docker tag ${full_name} \$AWS_ECR_REPO/${full_name}
-          docker push \$AWS_ECR_REPO/${full_name}
+          retry 5 docker push \$AWS_ECR_REPO/${full_name}
         """,
         label: 'Upload image to ECR'
       )
@@ -391,7 +459,8 @@ def ecr_pull(full_name) {
       sh(
         script: """
           set -eux
-          docker pull ${full_name}
+          . ci/scripts/retry.sh
+          retry 5 docker pull ${full_name}
         """,
         label: 'Pull image from ECR'
       )
@@ -433,7 +502,18 @@ def build_docker_images() {
             // We're purposefully not setting the built image here since they
             // are not yet being uploaded to tlcpack
             // ci_arm = build_image('ci_arm')
-            build_image('ci_arm')
+            built_ci_arm = build_image('ci_arm');
+          }
+        }
+      },
+      'ci_cortexm': {
+        node('CPU') {
+          timeout(time: max_time, unit: 'MINUTES') {
+            init_git()
+            // We're purposefully not setting the built image here since they
+            // are not yet being uploaded to tlcpack
+            // ci_cortexm = build_image('ci_cortexm')
+            built_ci_cortexm = build_image('ci_cortexm');
           }
         }
       },
@@ -444,7 +524,7 @@ def build_docker_images() {
             // We're purposefully not setting the built image here since they
             // are not yet being uploaded to tlcpack
             // ci_cpu = build_image('ci_cpu')
-            build_image('ci_cpu')
+            built_ci_cpu = build_image('ci_cpu');
           }
         }
       },
@@ -455,7 +535,7 @@ def build_docker_images() {
             // We're purposefully not setting the built image here since they
             // are not yet being uploaded to tlcpack
             // ci_gpu = build_image('ci_gpu')
-            build_image('ci_gpu')
+            built_ci_gpu = build_image('ci_gpu');
           }
         }
       },
@@ -466,7 +546,7 @@ def build_docker_images() {
             // We're purposefully not setting the built image here since they
             // are not yet being uploaded to tlcpack
             // ci_hexagon = build_image('ci_hexagon')
-            build_image('ci_hexagon')
+            built_ci_hexagon = build_image('ci_hexagon');
           }
         }
       },
@@ -477,7 +557,7 @@ def build_docker_images() {
             // We're purposefully not setting the built image here since they
             // are not yet being uploaded to tlcpack
             // ci_i386 = build_image('ci_i386')
-            build_image('ci_i386')
+            built_ci_i386 = build_image('ci_i386');
           }
         }
       },
@@ -488,18 +568,29 @@ def build_docker_images() {
             // We're purposefully not setting the built image here since they
             // are not yet being uploaded to tlcpack
             // ci_lint = build_image('ci_lint')
-            build_image('ci_lint')
+            built_ci_lint = build_image('ci_lint');
           }
         }
       },
-      'ci_qemu': {
+      'ci_minimal': {
         node('CPU') {
           timeout(time: max_time, unit: 'MINUTES') {
             init_git()
             // We're purposefully not setting the built image here since they
             // are not yet being uploaded to tlcpack
-            // ci_qemu = build_image('ci_qemu')
-            build_image('ci_qemu')
+            // ci_minimal = build_image('ci_minimal')
+            built_ci_minimal = build_image('ci_minimal');
+          }
+        }
+      },
+      'ci_riscv': {
+        node('CPU') {
+          timeout(time: max_time, unit: 'MINUTES') {
+            init_git()
+            // We're purposefully not setting the built image here since they
+            // are not yet being uploaded to tlcpack
+            // ci_riscv = build_image('ci_riscv')
+            built_ci_riscv = build_image('ci_riscv');
           }
         }
       },
@@ -510,7 +601,7 @@ def build_docker_images() {
             // We're purposefully not setting the built image here since they
             // are not yet being uploaded to tlcpack
             // ci_wasm = build_image('ci_wasm')
-            build_image('ci_wasm')
+            built_ci_wasm = build_image('ci_wasm');
           }
         }
       },
@@ -523,12 +614,14 @@ def lint() {
   'Lint 1 of 2': {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/lint") {
-        docker_init(ci_lint)
         init_git()
+        docker_init(ci_lint)
         timeout(time: max_time, unit: 'MINUTES') {
           withEnv([
             'TVM_NUM_SHARDS=2',
-            'TVM_SHARD_INDEX=0'], {
+            'TEST_STEP_NAME=Lint',
+            'TVM_SHARD_INDEX=0',
+            "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
             sh (
                 script: "${docker_run} ${ci_lint} ./tests/scripts/task_lint.sh",
                 label: 'Run lint',
@@ -541,12 +634,14 @@ def lint() {
   'Lint 2 of 2': {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/lint") {
-        docker_init(ci_lint)
         init_git()
+        docker_init(ci_lint)
         timeout(time: max_time, unit: 'MINUTES') {
           withEnv([
             'TVM_NUM_SHARDS=2',
-            'TVM_SHARD_INDEX=1'], {
+            'TEST_STEP_NAME=Lint',
+            'TVM_SHARD_INDEX=1',
+            "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
             sh (
                 script: "${docker_run} ${ci_lint} ./tests/scripts/task_lint.sh",
                 label: 'Run lint',
@@ -594,7 +689,6 @@ def cpp_unittest(image) {
   )
 }
 
-
 def add_microtvm_permissions() {
   sh(
     script: 'find build/microtvm_template_projects -type f | grep qemu-hack | xargs chmod +x',
@@ -638,26 +732,29 @@ stage('Build') {
     SKIP_SLOW_TESTS = "${skip_slow_tests}"
   }
   parallel(
-    'BUILD: GPU': {
+
+  'BUILD: GPU': {
     if (!skip_ci) {
       node('CPU-SMALL') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-gpu") {
-          docker_init(ci_gpu)
           init_git()
-          sh "${docker_run} --no-gpu ${ci_gpu} ./tests/scripts/task_config_build_gpu.sh build"
+          docker_init(ci_gpu)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh "${docker_run} --no-gpu ${ci_gpu} ./tests/scripts/task_config_build_gpu.sh build"
           make("${ci_gpu} --no-gpu", 'build', '-j2')
           sh(
             script: """
               set -eux
+              . ci/scripts/retry.sh
               md5sum build/libtvm.so
-              aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/gpu/build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/gpu/build/libtvm.so
               md5sum build/libvta_fsim.so
-              aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/gpu/build/libvta_fsim.so
+              retry 3 aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/gpu/build/libvta_fsim.so
               md5sum build/libtvm_runtime.so
-              aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/gpu/build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/gpu/build/libtvm_runtime.so
               md5sum build/config.cmake
-              aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/gpu/build/config.cmake
-              aws s3 cp --no-progress build/microtvm_template_projects s3://${s3_prefix}/gpu/build/microtvm_template_projects --recursive
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/gpu/build/config.cmake
+              retry 3 aws s3 cp --no-progress build/microtvm_template_projects s3://${s3_prefix}/gpu/build/microtvm_template_projects --recursive
             """,
             label: 'Upload artifacts to S3',
           )
@@ -669,29 +766,34 @@ stage('Build') {
           sh(
             script: """
               set -eux
+              . ci/scripts/retry.sh
               md5sum build/libtvm.so
-              aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/gpu2/build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/gpu2/build/libtvm.so
               md5sum build/libvta_fsim.so
-              aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/gpu2/build/libvta_fsim.so
+              retry 3 aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/gpu2/build/libvta_fsim.so
               md5sum build/libtvm_runtime.so
-              aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/gpu2/build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/gpu2/build/libtvm_runtime.so
               md5sum build/config.cmake
-              aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/gpu2/build/config.cmake
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/gpu2/build/config.cmake
             """,
             label: 'Upload artifacts to S3',
           )
-
+          }
         }
       }
+    } else {
+      Utils.markStageSkippedForConditional('BUILD: GPU')
     }
   },
+
   'BUILD: CPU': {
     if (!skip_ci && is_docs_only_build != 1) {
       node('CPU-SMALL') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-cpu") {
-          docker_init(ci_cpu)
           init_git()
-          sh (
+          docker_init(ci_cpu)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh (
             script: "${docker_run} ${ci_cpu} ./tests/scripts/task_config_build_cpu.sh build",
             label: 'Create CPU cmake config',
           )
@@ -699,25 +801,25 @@ stage('Build') {
           sh(
             script: """
               set -eux
+              . ci/scripts/retry.sh
               md5sum build/libvta_tsim.so
-              aws s3 cp --no-progress build/libvta_tsim.so s3://${s3_prefix}/cpu/build/libvta_tsim.so
+              retry 3 aws s3 cp --no-progress build/libvta_tsim.so s3://${s3_prefix}/cpu/build/libvta_tsim.so
               md5sum build/libtvm.so
-              aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/cpu/build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/cpu/build/libtvm.so
               md5sum build/libvta_fsim.so
-              aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/cpu/build/libvta_fsim.so
+              retry 3 aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/cpu/build/libvta_fsim.so
               md5sum build/libtvm_runtime.so
-              aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/cpu/build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/cpu/build/libtvm_runtime.so
               md5sum build/config.cmake
-              aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/cpu/build/config.cmake
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/cpu/build/config.cmake
             """,
             label: 'Upload artifacts to S3',
           )
 
-          timeout(time: max_time, unit: 'MINUTES') {
-            ci_setup(ci_cpu)
-            // sh "${docker_run} ${ci_cpu} ./tests/scripts/task_golang.sh"
-            // TODO(@jroesch): need to resolve CI issue will turn back on in follow up patch
-            sh (script: "${docker_run} ${ci_cpu} ./tests/scripts/task_rust.sh", label: 'Rust build and test')
+          ci_setup(ci_cpu)
+          // sh "${docker_run} ${ci_cpu} ./tests/scripts/task_golang.sh"
+          // TODO(@jroesch): need to resolve CI issue will turn back on in follow up patch
+          sh (script: "${docker_run} ${ci_cpu} ./tests/scripts/task_rust.sh", label: 'Rust build and test')
           }
         }
       }
@@ -725,24 +827,58 @@ stage('Build') {
       Utils.markStageSkippedForConditional('BUILD: CPU')
     }
   },
+
+  'BUILD: CPU MINIMAL': {
+    if (!skip_ci && is_docs_only_build != 1) {
+      node('CPU-SMALL') {
+        ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-cpu-minimal") {
+          init_git()
+          docker_init(ci_minimal)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh (
+            script: "${docker_run} ${ci_minimal} ./tests/scripts/task_config_build_minimal.sh build",
+            label: 'Create CPU minimal cmake config',
+          )
+          make(ci_minimal, 'build', '-j2')
+          sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              md5sum build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/cpu-minimal/build/libtvm.so
+              md5sum build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/cpu-minimal/build/libtvm_runtime.so
+              md5sum build/config.cmake
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/cpu-minimal/build/config.cmake
+            """,
+            label: 'Upload artifacts to S3',
+          )
+          }
+        }
+      }
+    } else {
+      Utils.markStageSkippedForConditional('BUILD: CPU MINIMAL')
+    }
+  },
+
   'BUILD: WASM': {
     if (!skip_ci && is_docs_only_build != 1) {
       node('CPU-SMALL') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-wasm") {
-          docker_init(ci_wasm)
           init_git()
-          sh (
+          docker_init(ci_wasm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh (
             script: "${docker_run} ${ci_wasm} ./tests/scripts/task_config_build_wasm.sh build",
             label: 'Create WASM cmake config',
           )
           make(ci_wasm, 'build', '-j2')
           cpp_unittest(ci_wasm)
-          timeout(time: max_time, unit: 'MINUTES') {
-            ci_setup(ci_wasm)
-            sh (
-              script: "${docker_run} ${ci_wasm} ./tests/scripts/task_web_wasm.sh",
-              label: 'Run WASM lint and tests',
-            )
+          ci_setup(ci_wasm)
+          sh (
+            script: "${docker_run} ${ci_wasm} ./tests/scripts/task_web_wasm.sh",
+            label: 'Run WASM lint and tests',
+          )
           }
         }
       }
@@ -750,13 +886,15 @@ stage('Build') {
       Utils.markStageSkippedForConditional('BUILD: WASM')
     }
   },
+
   'BUILD: i386': {
     if (!skip_ci && is_docs_only_build != 1) {
       node('CPU-SMALL') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-i386") {
-          docker_init(ci_i386)
           init_git()
-          sh (
+          docker_init(ci_i386)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh (
             script: "${docker_run} ${ci_i386} ./tests/scripts/task_config_build_i386.sh build",
             label: 'Create i386 cmake config',
           )
@@ -764,33 +902,36 @@ stage('Build') {
           sh(
             script: """
               set -eux
+              . ci/scripts/retry.sh
               md5sum build/libvta_tsim.so
-              aws s3 cp --no-progress build/libvta_tsim.so s3://${s3_prefix}/i386/build/libvta_tsim.so
+              retry 3 aws s3 cp --no-progress build/libvta_tsim.so s3://${s3_prefix}/i386/build/libvta_tsim.so
               md5sum build/libtvm.so
-              aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/i386/build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/i386/build/libtvm.so
               md5sum build/libvta_fsim.so
-              aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/i386/build/libvta_fsim.so
+              retry 3 aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/i386/build/libvta_fsim.so
               md5sum build/libtvm_runtime.so
-              aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/i386/build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/i386/build/libtvm_runtime.so
               md5sum build/config.cmake
-              aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/i386/build/config.cmake
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/i386/build/config.cmake
             """,
             label: 'Upload artifacts to S3',
           )
-
+          }
         }
       }
     } else {
       Utils.markStageSkippedForConditional('BUILD: i386')
     }
   },
+
   'BUILD: arm': {
     if (!skip_ci && is_docs_only_build != 1) {
       node('ARM-SMALL') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-arm") {
-          docker_init(ci_arm)
           init_git()
-          sh (
+          docker_init(ci_arm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh (
             script: "${docker_run} ${ci_arm} ./tests/scripts/task_config_build_arm.sh build",
             label: 'Create ARM cmake config',
           )
@@ -798,62 +939,68 @@ stage('Build') {
           sh(
             script: """
               set -eux
+              . ci/scripts/retry.sh
               md5sum build/libtvm.so
-              aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/arm/build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/arm/build/libtvm.so
               md5sum build/libvta_fsim.so
-              aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/arm/build/libvta_fsim.so
+              retry 3 aws s3 cp --no-progress build/libvta_fsim.so s3://${s3_prefix}/arm/build/libvta_fsim.so
               md5sum build/libtvm_runtime.so
-              aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/arm/build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/arm/build/libtvm_runtime.so
               md5sum build/config.cmake
-              aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/arm/build/config.cmake
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/arm/build/config.cmake
             """,
             label: 'Upload artifacts to S3',
           )
-
+          }
         }
       }
-     } else {
+    } else {
       Utils.markStageSkippedForConditional('BUILD: arm')
     }
   },
-  'BUILD: QEMU': {
+
+  'BUILD: Cortex-M': {
     if (!skip_ci && is_docs_only_build != 1) {
       node('CPU-SMALL') {
-        ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-qemu") {
-          docker_init(ci_qemu)
+        ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-cortexm") {
           init_git()
-          sh (
-            script: "${docker_run} ${ci_qemu} ./tests/scripts/task_config_build_qemu.sh build",
-            label: 'Create QEMU cmake config',
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh (
+            script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_config_build_cortexm.sh build",
+            label: 'Create Cortex-M cmake config',
           )
-          make(ci_qemu, 'build', '-j2')
+          make(ci_cortexm, 'build', '-j2')
           sh(
             script: """
               set -eux
+              . ci/scripts/retry.sh
               md5sum build/libtvm.so
-              aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/qemu/build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/cortexm/build/libtvm.so
               md5sum build/libtvm_runtime.so
-              aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/qemu/build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/cortexm/build/libtvm_runtime.so
               md5sum build/config.cmake
-              aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/qemu/build/config.cmake
-              aws s3 cp --no-progress build/microtvm_template_projects s3://${s3_prefix}/qemu/build/microtvm_template_projects --recursive
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/cortexm/build/config.cmake
+              retry 3 aws s3 cp --no-progress build/microtvm_template_projects s3://${s3_prefix}/cortexm/build/microtvm_template_projects --recursive
             """,
             label: 'Upload artifacts to S3',
           )
-
+          }
         }
       }
-     } else {
-      Utils.markStageSkippedForConditional('BUILD: QEMU')
+    } else {
+      Utils.markStageSkippedForConditional('BUILD: Cortex-M')
     }
   },
+
   'BUILD: Hexagon': {
     if (!skip_ci && is_docs_only_build != 1) {
       node('CPU-SMALL') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-hexagon") {
-          docker_init(ci_hexagon)
           init_git()
-          sh (
+          docker_init(ci_hexagon)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh (
             script: "${docker_run} ${ci_hexagon} ./tests/scripts/task_config_build_hexagon.sh build",
             label: 'Create Hexagon cmake config',
           )
@@ -865,23 +1012,59 @@ stage('Build') {
           sh(
             script: """
               set -eux
+              . ci/scripts/retry.sh
               md5sum build/libtvm.so
-              aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/hexagon/build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/hexagon/build/libtvm.so
               md5sum build/libtvm_runtime.so
-              aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/hexagon/build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/hexagon/build/libtvm_runtime.so
               md5sum build/config.cmake
-              aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/hexagon/build/config.cmake
-              aws s3 cp --no-progress build/hexagon_api_output s3://${s3_prefix}/hexagon/build/hexagon_api_output --recursive
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/hexagon/build/config.cmake
+              retry 3 aws s3 cp --no-progress build/hexagon_api_output s3://${s3_prefix}/hexagon/build/hexagon_api_output --recursive
             """,
             label: 'Upload artifacts to S3',
           )
-
+          }
         }
       }
-     } else {
+    } else {
       Utils.markStageSkippedForConditional('BUILD: Hexagon')
     }
   },
+
+  'BUILD: RISC-V': {
+    if (!skip_ci && is_docs_only_build != 1) {
+      node('CPU-SMALL') {
+        ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-riscv") {
+          init_git()
+          docker_init(ci_riscv)
+          timeout(time: max_time, unit: 'MINUTES') {
+            sh (
+            script: "${docker_run} ${ci_riscv} ./tests/scripts/task_config_build_riscv.sh build",
+            label: 'Create RISC-V cmake config',
+          )
+          make(ci_riscv, 'build', '-j2')
+          sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              md5sum build/libtvm.so
+              retry 3 aws s3 cp --no-progress build/libtvm.so s3://${s3_prefix}/riscv/build/libtvm.so
+              md5sum build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress build/libtvm_runtime.so s3://${s3_prefix}/riscv/build/libtvm_runtime.so
+              md5sum build/config.cmake
+              retry 3 aws s3 cp --no-progress build/config.cmake s3://${s3_prefix}/riscv/build/config.cmake
+              retry 3 aws s3 cp --no-progress build/microtvm_template_projects s3://${s3_prefix}/riscv/build/microtvm_template_projects --recursive
+            """,
+            label: 'Upload artifacts to S3',
+          )
+          }
+        }
+      }
+    } else {
+      Utils.markStageSkippedForConditional('BUILD: RISC-V')
+    }
+  },
+
   )
 }
 }
@@ -896,23 +1079,26 @@ def shard_run_unittest_GPU_1_of_3() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=unittest: GPU',
               'TVM_NUM_SHARDS=3',
-              'TVM_SHARD_INDEX=0'], {
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu2/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu2/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu2/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu2/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu2/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu2/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu2/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu2/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -923,13 +1109,14 @@ def shard_run_unittest_GPU_1_of_3() {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -948,15 +1135,20 @@ def shard_run_unittest_GPU_1_of_3() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/unittest_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -970,23 +1162,26 @@ def shard_run_unittest_GPU_2_of_3() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=unittest: GPU',
               'TVM_NUM_SHARDS=3',
-              'TVM_SHARD_INDEX=1'], {
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1008,15 +1203,20 @@ def shard_run_unittest_GPU_2_of_3() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/unittest_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -1030,23 +1230,26 @@ def shard_run_unittest_GPU_3_of_3() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=unittest: GPU',
               'TVM_NUM_SHARDS=3',
-              'TVM_SHARD_INDEX=2'], {
+              'TVM_SHARD_INDEX=2',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1064,15 +1267,20 @@ def shard_run_unittest_GPU_3_of_3() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/unittest_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -1082,30 +1290,33 @@ def shard_run_unittest_GPU_3_of_3() {
 }
 
 
-def shard_run_integration_CPU_1_of_6() {
+def shard_run_integration_CPU_1_of_4() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-cpu") {
         try {
-          docker_init(ci_cpu)
           init_git()
+          docker_init(ci_cpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=cpu',
-              'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=0'], {
+              'TEST_STEP_NAME=integration: CPU',
+              'TVM_NUM_SHARDS=4',
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
                           md5sum build/libvta_tsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1119,47 +1330,55 @@ def shard_run_integration_CPU_1_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/integration_CPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('integration: CPU 1 of 6')
+    Utils.markStageSkippedForConditional('integration: CPU 1 of 4')
   }
 }
 
-def shard_run_integration_CPU_2_of_6() {
+def shard_run_integration_CPU_2_of_4() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-cpu") {
         try {
-          docker_init(ci_cpu)
           init_git()
+          docker_init(ci_cpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=cpu',
-              'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=1'], {
+              'TEST_STEP_NAME=integration: CPU',
+              'TVM_NUM_SHARDS=4',
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
                           md5sum build/libvta_tsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1173,47 +1392,55 @@ def shard_run_integration_CPU_2_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/integration_CPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('integration: CPU 2 of 6')
+    Utils.markStageSkippedForConditional('integration: CPU 2 of 4')
   }
 }
 
-def shard_run_integration_CPU_3_of_6() {
+def shard_run_integration_CPU_3_of_4() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-cpu") {
         try {
-          docker_init(ci_cpu)
           init_git()
+          docker_init(ci_cpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=cpu',
-              'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=2'], {
+              'TEST_STEP_NAME=integration: CPU',
+              'TVM_NUM_SHARDS=4',
+              'TVM_SHARD_INDEX=2',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
                           md5sum build/libvta_tsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1227,47 +1454,55 @@ def shard_run_integration_CPU_3_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/integration_CPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('integration: CPU 3 of 6')
+    Utils.markStageSkippedForConditional('integration: CPU 3 of 4')
   }
 }
 
-def shard_run_integration_CPU_4_of_6() {
+def shard_run_integration_CPU_4_of_4() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-cpu") {
         try {
-          docker_init(ci_cpu)
           init_git()
+          docker_init(ci_cpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=cpu',
-              'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=3'], {
+              'TEST_STEP_NAME=integration: CPU',
+              'TVM_NUM_SHARDS=4',
+              'TVM_SHARD_INDEX=3',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
                           md5sum build/libvta_tsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1281,154 +1516,54 @@ def shard_run_integration_CPU_4_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/integration_CPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
-        }
-      }
-    }
-  } else {
-    Utils.markStageSkippedForConditional('integration: CPU 4 of 6')
-  }
-}
-
-def shard_run_integration_CPU_5_of_6() {
-  if (!skip_ci && is_docs_only_build != 1) {
-    node('CPU-SMALL') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-cpu") {
-        try {
-          docker_init(ci_cpu)
-          init_git()
-          timeout(time: max_time, unit: 'MINUTES') {
-            withEnv([
-              'PLATFORM=cpu',
-              'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=4'], {
-              sh(
-                        script: """
-                          set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
-                          md5sum build/libvta_tsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
-                          md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
-                          md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
-                          md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
-                          md5sum build/config.cmake
-                        """,
-                        label: 'Download artifacts from S3',
-                      )
-
-              ci_setup(ci_cpu)
-              sh (
-                script: "${docker_run} ${ci_cpu} ./tests/scripts/task_python_integration.sh",
-                label: 'Run CPU integration tests',
-              )
-            })
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
           }
-        } finally {
-          sh(
-            script: """
-              set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
-            """,
-            label: 'Upload JUnits to S3',
-          )
-
-          junit 'build/pytest-results/*.xml'
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('integration: CPU 5 of 6')
-  }
-}
-
-def shard_run_integration_CPU_6_of_6() {
-  if (!skip_ci && is_docs_only_build != 1) {
-    node('CPU-SMALL') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-cpu") {
-        try {
-          docker_init(ci_cpu)
-          init_git()
-          timeout(time: max_time, unit: 'MINUTES') {
-            withEnv([
-              'PLATFORM=cpu',
-              'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=5'], {
-              sh(
-                        script: """
-                          set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
-                          md5sum build/libvta_tsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
-                          md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
-                          md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
-                          md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
-                          md5sum build/config.cmake
-                        """,
-                        label: 'Download artifacts from S3',
-                      )
-
-              ci_setup(ci_cpu)
-              sh (
-                script: "${docker_run} ${ci_cpu} ./tests/scripts/task_python_integration.sh",
-                label: 'Run CPU integration tests',
-              )
-            })
-          }
-        } finally {
-          sh(
-            script: """
-              set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
-            """,
-            label: 'Upload JUnits to S3',
-          )
-
-          junit 'build/pytest-results/*.xml'
-        }
-      }
-    }
-  } else {
-    Utils.markStageSkippedForConditional('integration: CPU 6 of 6')
+    Utils.markStageSkippedForConditional('integration: CPU 4 of 4')
   }
 }
 
 
-def shard_run_python_i386_1_of_5() {
+def shard_run_python_i386_1_of_3() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-i386") {
         try {
-          docker_init(ci_i386)
           init_git()
+          docker_init(ci_i386)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=i386',
-              'TVM_NUM_SHARDS=5',
-              'TVM_SHARD_INDEX=0'], {
+              'TEST_STEP_NAME=python: i386',
+              'TVM_NUM_SHARDS=3',
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1444,45 +1579,53 @@ def shard_run_python_i386_1_of_5() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/python_i386 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('python: i386 1 of 5')
+    Utils.markStageSkippedForConditional('python: i386 1 of 3')
   }
 }
 
-def shard_run_python_i386_2_of_5() {
+def shard_run_python_i386_2_of_3() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-i386") {
         try {
-          docker_init(ci_i386)
           init_git()
+          docker_init(ci_i386)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=i386',
-              'TVM_NUM_SHARDS=5',
-              'TVM_SHARD_INDEX=1'], {
+              'TEST_STEP_NAME=python: i386',
+              'TVM_NUM_SHARDS=3',
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1498,45 +1641,53 @@ def shard_run_python_i386_2_of_5() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/python_i386 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('python: i386 2 of 5')
+    Utils.markStageSkippedForConditional('python: i386 2 of 3')
   }
 }
 
-def shard_run_python_i386_3_of_5() {
+def shard_run_python_i386_3_of_3() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-i386") {
         try {
-          docker_init(ci_i386)
           init_git()
+          docker_init(ci_i386)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=i386',
-              'TVM_NUM_SHARDS=5',
-              'TVM_SHARD_INDEX=2'], {
+              'TEST_STEP_NAME=python: i386',
+              'TVM_NUM_SHARDS=3',
+              'TVM_SHARD_INDEX=2',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/i386/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -1551,152 +1702,54 @@ def shard_run_python_i386_3_of_5() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/python_i386 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
-        }
-      }
-    }
-  } else {
-    Utils.markStageSkippedForConditional('python: i386 3 of 5')
-  }
-}
-
-def shard_run_python_i386_4_of_5() {
-  if (!skip_ci && is_docs_only_build != 1) {
-    node('CPU-SMALL') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-i386") {
-        try {
-          docker_init(ci_i386)
-          init_git()
-          timeout(time: max_time, unit: 'MINUTES') {
-            withEnv([
-              'PLATFORM=i386',
-              'TVM_NUM_SHARDS=5',
-              'TVM_SHARD_INDEX=3'], {
-              sh(
-                        script: """
-                          set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm.so build/libtvm.so
-                          md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libvta_fsim.so build/libvta_fsim.so
-                          md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm_runtime.so build/libtvm_runtime.so
-                          md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/config.cmake build/config.cmake
-                          md5sum build/config.cmake
-                        """,
-                        label: 'Download artifacts from S3',
-                      )
-
-              ci_setup(ci_i386)
-              python_unittest(ci_i386)
-              sh (
-                script: "${docker_run} ${ci_i386} ./tests/scripts/task_python_integration_i386only.sh",
-                label: 'Run i386 integration tests',
-              )
-            })
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
           }
-        } finally {
-          sh(
-            script: """
-              set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
-            """,
-            label: 'Upload JUnits to S3',
-          )
-
-          junit 'build/pytest-results/*.xml'
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('python: i386 4 of 5')
-  }
-}
-
-def shard_run_python_i386_5_of_5() {
-  if (!skip_ci && is_docs_only_build != 1) {
-    node('CPU-SMALL') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/integration-python-i386") {
-        try {
-          docker_init(ci_i386)
-          init_git()
-          timeout(time: max_time, unit: 'MINUTES') {
-            withEnv([
-              'PLATFORM=i386',
-              'TVM_NUM_SHARDS=5',
-              'TVM_SHARD_INDEX=4'], {
-              sh(
-                        script: """
-                          set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm.so build/libtvm.so
-                          md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libvta_fsim.so build/libvta_fsim.so
-                          md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/libtvm_runtime.so build/libtvm_runtime.so
-                          md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/i386/build/config.cmake build/config.cmake
-                          md5sum build/config.cmake
-                        """,
-                        label: 'Download artifacts from S3',
-                      )
-
-              ci_setup(ci_i386)
-              python_unittest(ci_i386)
-              sh (
-                script: "${docker_run} ${ci_i386} ./tests/scripts/task_python_integration_i386only.sh",
-                label: 'Run i386 integration tests',
-              )
-            })
-          }
-        } finally {
-          sh(
-            script: """
-              set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
-            """,
-            label: 'Upload JUnits to S3',
-          )
-
-          junit 'build/pytest-results/*.xml'
-        }
-      }
-    }
-  } else {
-    Utils.markStageSkippedForConditional('python: i386 5 of 5')
+    Utils.markStageSkippedForConditional('python: i386 3 of 3')
   }
 }
 
 
-def shard_run_test_Hexagon_1_of_7() {
+def shard_run_test_Hexagon_1_of_8() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-hexagon") {
         try {
-          docker_init(ci_hexagon)
           init_git()
+          docker_init(ci_hexagon)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=hexagon',
-              'TVM_NUM_SHARDS=7',
-              'TVM_SHARD_INDEX=0'], {
+              'TEST_STEP_NAME=test: Hexagon',
+              'TVM_NUM_SHARDS=8',
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
@@ -1711,45 +1764,53 @@ def shard_run_test_Hexagon_1_of_7() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Hexagon --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Hexagon 1 of 7')
+    Utils.markStageSkippedForConditional('test: Hexagon 1 of 8')
   }
 }
 
-def shard_run_test_Hexagon_2_of_7() {
+def shard_run_test_Hexagon_2_of_8() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-hexagon") {
         try {
-          docker_init(ci_hexagon)
           init_git()
+          docker_init(ci_hexagon)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=hexagon',
-              'TVM_NUM_SHARDS=7',
-              'TVM_SHARD_INDEX=1'], {
+              'TEST_STEP_NAME=test: Hexagon',
+              'TVM_NUM_SHARDS=8',
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
@@ -1763,45 +1824,53 @@ def shard_run_test_Hexagon_2_of_7() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Hexagon --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Hexagon 2 of 7')
+    Utils.markStageSkippedForConditional('test: Hexagon 2 of 8')
   }
 }
 
-def shard_run_test_Hexagon_3_of_7() {
+def shard_run_test_Hexagon_3_of_8() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-hexagon") {
         try {
-          docker_init(ci_hexagon)
           init_git()
+          docker_init(ci_hexagon)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=hexagon',
-              'TVM_NUM_SHARDS=7',
-              'TVM_SHARD_INDEX=2'], {
+              'TEST_STEP_NAME=test: Hexagon',
+              'TVM_NUM_SHARDS=8',
+              'TVM_SHARD_INDEX=2',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
@@ -1815,45 +1884,53 @@ def shard_run_test_Hexagon_3_of_7() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Hexagon --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Hexagon 3 of 7')
+    Utils.markStageSkippedForConditional('test: Hexagon 3 of 8')
   }
 }
 
-def shard_run_test_Hexagon_4_of_7() {
+def shard_run_test_Hexagon_4_of_8() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-hexagon") {
         try {
-          docker_init(ci_hexagon)
           init_git()
+          docker_init(ci_hexagon)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=hexagon',
-              'TVM_NUM_SHARDS=7',
-              'TVM_SHARD_INDEX=3'], {
+              'TEST_STEP_NAME=test: Hexagon',
+              'TVM_NUM_SHARDS=8',
+              'TVM_SHARD_INDEX=3',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
@@ -1867,45 +1944,53 @@ def shard_run_test_Hexagon_4_of_7() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Hexagon --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Hexagon 4 of 7')
+    Utils.markStageSkippedForConditional('test: Hexagon 4 of 8')
   }
 }
 
-def shard_run_test_Hexagon_5_of_7() {
+def shard_run_test_Hexagon_5_of_8() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-hexagon") {
         try {
-          docker_init(ci_hexagon)
           init_git()
+          docker_init(ci_hexagon)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=hexagon',
-              'TVM_NUM_SHARDS=7',
-              'TVM_SHARD_INDEX=4'], {
+              'TEST_STEP_NAME=test: Hexagon',
+              'TVM_NUM_SHARDS=8',
+              'TVM_SHARD_INDEX=4',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
@@ -1919,45 +2004,53 @@ def shard_run_test_Hexagon_5_of_7() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Hexagon --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Hexagon 5 of 7')
+    Utils.markStageSkippedForConditional('test: Hexagon 5 of 8')
   }
 }
 
-def shard_run_test_Hexagon_6_of_7() {
+def shard_run_test_Hexagon_6_of_8() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-hexagon") {
         try {
-          docker_init(ci_hexagon)
           init_git()
+          docker_init(ci_hexagon)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=hexagon',
-              'TVM_NUM_SHARDS=7',
-              'TVM_SHARD_INDEX=5'], {
+              'TEST_STEP_NAME=test: Hexagon',
+              'TVM_NUM_SHARDS=8',
+              'TVM_SHARD_INDEX=5',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
@@ -1971,45 +2064,53 @@ def shard_run_test_Hexagon_6_of_7() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Hexagon --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Hexagon 6 of 7')
+    Utils.markStageSkippedForConditional('test: Hexagon 6 of 8')
   }
 }
 
-def shard_run_test_Hexagon_7_of_7() {
+def shard_run_test_Hexagon_7_of_8() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-hexagon") {
         try {
-          docker_init(ci_hexagon)
           init_git()
+          docker_init(ci_hexagon)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=hexagon',
-              'TVM_NUM_SHARDS=7',
-              'TVM_SHARD_INDEX=6'], {
+              'TEST_STEP_NAME=test: Hexagon',
+              'TVM_NUM_SHARDS=8',
+              'TVM_SHARD_INDEX=6',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
@@ -2023,20 +2124,85 @@ def shard_run_test_Hexagon_7_of_7() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Hexagon --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Hexagon 7 of 7')
+    Utils.markStageSkippedForConditional('test: Hexagon 7 of 8')
+  }
+}
+
+def shard_run_test_Hexagon_8_of_8() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-hexagon") {
+        try {
+          init_git()
+          docker_init(ci_hexagon)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=hexagon',
+              'TEST_STEP_NAME=test: Hexagon',
+              'TVM_NUM_SHARDS=8',
+              'TVM_SHARD_INDEX=7',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/hexagon/build/hexagon_api_output build/hexagon_api_output --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_hexagon_permissions()
+              ci_setup(ci_hexagon)
+              sh (
+                script: "${docker_run} ${ci_hexagon} ./tests/scripts/task_python_hexagon.sh",
+                label: 'Run Hexagon tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Hexagon --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Hexagon 8 of 8')
   }
 }
 
@@ -2046,23 +2212,26 @@ def shard_run_integration_aarch64_1_of_4() {
     node('ARM-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-arm") {
         try {
-          docker_init(ci_arm)
           init_git()
+          docker_init(ci_arm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=arm',
+              'TEST_STEP_NAME=integration: aarch64',
               'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=0'], {
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2077,15 +2246,20 @@ def shard_run_integration_aarch64_1_of_4() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/integration_aarch64 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2099,23 +2273,26 @@ def shard_run_integration_aarch64_2_of_4() {
     node('ARM-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-arm") {
         try {
-          docker_init(ci_arm)
           init_git()
+          docker_init(ci_arm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=arm',
+              'TEST_STEP_NAME=integration: aarch64',
               'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=1'], {
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2130,15 +2307,20 @@ def shard_run_integration_aarch64_2_of_4() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/integration_aarch64 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2152,23 +2334,26 @@ def shard_run_integration_aarch64_3_of_4() {
     node('ARM-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-arm") {
         try {
-          docker_init(ci_arm)
           init_git()
+          docker_init(ci_arm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=arm',
+              'TEST_STEP_NAME=integration: aarch64',
               'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=2'], {
+              'TVM_SHARD_INDEX=2',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2183,15 +2368,20 @@ def shard_run_integration_aarch64_3_of_4() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/integration_aarch64 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2205,23 +2395,26 @@ def shard_run_integration_aarch64_4_of_4() {
     node('ARM-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-arm") {
         try {
-          docker_init(ci_arm)
           init_git()
+          docker_init(ci_arm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=arm',
+              'TEST_STEP_NAME=integration: aarch64',
               'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=3'], {
+              'TVM_SHARD_INDEX=3',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2236,15 +2429,20 @@ def shard_run_integration_aarch64_4_of_4() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/integration_aarch64 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2254,28 +2452,31 @@ def shard_run_integration_aarch64_4_of_4() {
 }
 
 
-def shard_run_topi_GPU_1_of_4() {
+def shard_run_topi_GPU_1_of_3() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/topi-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
-              'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=0'], {
+              'TEST_STEP_NAME=topi: GPU',
+              'TVM_NUM_SHARDS=3',
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2289,45 +2490,53 @@ def shard_run_topi_GPU_1_of_4() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/topi_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('topi: GPU 1 of 4')
+    Utils.markStageSkippedForConditional('topi: GPU 1 of 3')
   }
 }
 
-def shard_run_topi_GPU_2_of_4() {
+def shard_run_topi_GPU_2_of_3() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/topi-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
-              'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=1'], {
+              'TEST_STEP_NAME=topi: GPU',
+              'TVM_NUM_SHARDS=3',
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2341,45 +2550,53 @@ def shard_run_topi_GPU_2_of_4() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/topi_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('topi: GPU 2 of 4')
+    Utils.markStageSkippedForConditional('topi: GPU 2 of 3')
   }
 }
 
-def shard_run_topi_GPU_3_of_4() {
+def shard_run_topi_GPU_3_of_3() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/topi-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
-              'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=2'], {
+              'TEST_STEP_NAME=topi: GPU',
+              'TVM_NUM_SHARDS=3',
+              'TVM_SHARD_INDEX=2',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2393,72 +2610,25 @@ def shard_run_topi_GPU_3_of_4() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/topi_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
-        }
-      }
-    }
-  } else {
-    Utils.markStageSkippedForConditional('topi: GPU 3 of 4')
-  }
-}
-
-def shard_run_topi_GPU_4_of_4() {
-  if (!skip_ci && is_docs_only_build != 1) {
-    node('GPU') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/topi-python-gpu") {
-        try {
-          docker_init(ci_gpu)
-          init_git()
-          timeout(time: max_time, unit: 'MINUTES') {
-            withEnv([
-              'PLATFORM=gpu',
-              'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=3'], {
-              sh(
-                        script: """
-                          set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
-                          md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
-                          md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
-                          md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
-                          md5sum build/config.cmake
-                        """,
-                        label: 'Download artifacts from S3',
-                      )
-
-              ci_setup(ci_gpu)
-              sh (
-                script: "${docker_run} ${ci_gpu} ./tests/scripts/task_python_topi.sh",
-                label: 'Run TOPI tests',
-              )
-            })
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
           }
-        } finally {
-          sh(
-            script: """
-              set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
-            """,
-            label: 'Upload JUnits to S3',
-          )
-
-          junit 'build/pytest-results/*.xml'
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('topi: GPU 4 of 4')
+    Utils.markStageSkippedForConditional('topi: GPU 3 of 3')
   }
 }
 
@@ -2468,23 +2638,26 @@ def shard_run_frontend_GPU_1_of_6() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=frontend: GPU',
               'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=0'], {
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2498,15 +2671,20 @@ def shard_run_frontend_GPU_1_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2520,23 +2698,26 @@ def shard_run_frontend_GPU_2_of_6() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=frontend: GPU',
               'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=1'], {
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2550,15 +2731,20 @@ def shard_run_frontend_GPU_2_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2572,23 +2758,26 @@ def shard_run_frontend_GPU_3_of_6() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=frontend: GPU',
               'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=2'], {
+              'TVM_SHARD_INDEX=2',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2602,15 +2791,20 @@ def shard_run_frontend_GPU_3_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2624,23 +2818,26 @@ def shard_run_frontend_GPU_4_of_6() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=frontend: GPU',
               'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=3'], {
+              'TVM_SHARD_INDEX=3',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2654,15 +2851,20 @@ def shard_run_frontend_GPU_4_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2676,23 +2878,26 @@ def shard_run_frontend_GPU_5_of_6() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=frontend: GPU',
               'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=4'], {
+              'TVM_SHARD_INDEX=4',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2706,15 +2911,20 @@ def shard_run_frontend_GPU_5_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2728,23 +2938,26 @@ def shard_run_frontend_GPU_6_of_6() {
     node('GPU') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-gpu") {
         try {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=gpu',
+              'TEST_STEP_NAME=frontend: GPU',
               'TVM_NUM_SHARDS=6',
-              'TVM_SHARD_INDEX=5'], {
+              'TVM_SHARD_INDEX=5',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2758,15 +2971,20 @@ def shard_run_frontend_GPU_6_of_6() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_GPU --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2781,23 +2999,26 @@ def shard_run_topi_aarch64_1_of_2() {
     node('ARM-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-arm") {
         try {
-          docker_init(ci_arm)
           init_git()
+          docker_init(ci_arm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=arm',
+              'TEST_STEP_NAME=topi: aarch64',
               'TVM_NUM_SHARDS=2',
-              'TVM_SHARD_INDEX=0'], {
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2816,15 +3037,20 @@ def shard_run_topi_aarch64_1_of_2() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/topi_aarch64 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2838,23 +3064,26 @@ def shard_run_topi_aarch64_2_of_2() {
     node('ARM-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-arm") {
         try {
-          docker_init(ci_arm)
           init_git()
+          docker_init(ci_arm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=arm',
+              'TEST_STEP_NAME=topi: aarch64',
               'TVM_NUM_SHARDS=2',
-              'TVM_SHARD_INDEX=1'], {
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2872,15 +3101,20 @@ def shard_run_topi_aarch64_2_of_2() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/topi_aarch64 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2895,23 +3129,26 @@ def shard_run_frontend_aarch64_1_of_2() {
     node('ARM-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-arm") {
         try {
-          docker_init(ci_arm)
           init_git()
+          docker_init(ci_arm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=arm',
+              'TEST_STEP_NAME=frontend: aarch64',
               'TVM_NUM_SHARDS=2',
-              'TVM_SHARD_INDEX=0'], {
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2925,15 +3162,20 @@ def shard_run_frontend_aarch64_1_of_2() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_aarch64 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2947,23 +3189,26 @@ def shard_run_frontend_aarch64_2_of_2() {
     node('ARM-SMALL') {
       ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-arm") {
         try {
-          docker_init(ci_arm)
           init_git()
+          docker_init(ci_arm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
               'PLATFORM=arm',
+              'TEST_STEP_NAME=frontend: aarch64',
               'TVM_NUM_SHARDS=2',
-              'TVM_SHARD_INDEX=1'], {
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/arm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -2977,15 +3222,20 @@ def shard_run_frontend_aarch64_2_of_2() {
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_aarch64 --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
@@ -2995,220 +3245,843 @@ def shard_run_frontend_aarch64_2_of_2() {
 }
 
 
-def shard_run_test_Qemu_1_of_4() {
+def shard_run_test_Cortex_M_1_of_12() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-qemu") {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
         try {
-          docker_init(ci_qemu)
           init_git()
+          docker_init(ci_cortexm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
-              'PLATFORM=qemu',
-              'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=0'], {
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
 
               add_microtvm_permissions()
-              ci_setup(ci_qemu)
-              cpp_unittest(ci_qemu)
+              ci_setup(ci_cortexm)
+              cpp_unittest(ci_cortexm)
               sh (
-                script: "${docker_run} ${ci_qemu} ./tests/scripts/task_demo_microtvm.sh",
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_demo_microtvm.sh",
                 label: 'Run microTVM demos',
               )
               sh (
-                script: "${docker_run} ${ci_qemu} ./tests/scripts/task_python_microtvm.sh",
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
                 label: 'Run microTVM tests',
               )
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Qemu 1 of 4')
+    Utils.markStageSkippedForConditional('test: Cortex-M 1 of 12')
   }
 }
 
-def shard_run_test_Qemu_2_of_4() {
+def shard_run_test_Cortex_M_2_of_12() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-qemu") {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
         try {
-          docker_init(ci_qemu)
           init_git()
+          docker_init(ci_cortexm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
-              'PLATFORM=qemu',
-              'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=1'], {
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=1',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
 
               add_microtvm_permissions()
-              ci_setup(ci_qemu)
+              ci_setup(ci_cortexm)
               sh (
-                script: "${docker_run} ${ci_qemu} ./tests/scripts/task_python_microtvm.sh",
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
                 label: 'Run microTVM tests',
               )
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Qemu 2 of 4')
+    Utils.markStageSkippedForConditional('test: Cortex-M 2 of 12')
   }
 }
 
-def shard_run_test_Qemu_3_of_4() {
+def shard_run_test_Cortex_M_3_of_12() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-qemu") {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
         try {
-          docker_init(ci_qemu)
           init_git()
+          docker_init(ci_cortexm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
-              'PLATFORM=qemu',
-              'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=2'], {
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=2',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
 
               add_microtvm_permissions()
-              ci_setup(ci_qemu)
+              ci_setup(ci_cortexm)
               sh (
-                script: "${docker_run} ${ci_qemu} ./tests/scripts/task_python_microtvm.sh",
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
                 label: 'Run microTVM tests',
               )
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Qemu 3 of 4')
+    Utils.markStageSkippedForConditional('test: Cortex-M 3 of 12')
   }
 }
 
-def shard_run_test_Qemu_4_of_4() {
+def shard_run_test_Cortex_M_4_of_12() {
   if (!skip_ci && is_docs_only_build != 1) {
     node('CPU-SMALL') {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-qemu") {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
         try {
-          docker_init(ci_qemu)
           init_git()
+          docker_init(ci_cortexm)
           timeout(time: max_time, unit: 'MINUTES') {
             withEnv([
-              'PLATFORM=qemu',
-              'TVM_NUM_SHARDS=4',
-              'TVM_SHARD_INDEX=3'], {
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=3',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
               sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
-                          aws s3 cp --no-progress s3://${s3_prefix}/qemu/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
                         """,
                         label: 'Download artifacts from S3',
                       )
 
               add_microtvm_permissions()
-              ci_setup(ci_qemu)
+              ci_setup(ci_cortexm)
               sh (
-                script: "${docker_run} ${ci_qemu} ./tests/scripts/task_python_microtvm.sh",
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
                 label: 'Run microTVM tests',
               )
             })
           }
         } finally {
-          sh(
+          try {
+            sh(
             script: """
               set -eux
-              aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
             """,
             label: 'Upload JUnits to S3',
           )
 
-          junit 'build/pytest-results/*.xml'
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
         }
       }
     }
   } else {
-    Utils.markStageSkippedForConditional('test: Qemu 4 of 4')
+    Utils.markStageSkippedForConditional('test: Cortex-M 4 of 12')
+  }
+}
+
+def shard_run_test_Cortex_M_5_of_12() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
+        try {
+          init_git()
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=4',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Cortex-M 5 of 12')
+  }
+}
+
+def shard_run_test_Cortex_M_6_of_12() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
+        try {
+          init_git()
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=5',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Cortex-M 6 of 12')
+  }
+}
+
+def shard_run_test_Cortex_M_7_of_12() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
+        try {
+          init_git()
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=6',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Cortex-M 7 of 12')
+  }
+}
+
+def shard_run_test_Cortex_M_8_of_12() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
+        try {
+          init_git()
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=7',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Cortex-M 8 of 12')
+  }
+}
+
+def shard_run_test_Cortex_M_9_of_12() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
+        try {
+          init_git()
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=8',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Cortex-M 9 of 12')
+  }
+}
+
+def shard_run_test_Cortex_M_10_of_12() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
+        try {
+          init_git()
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=9',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Cortex-M 10 of 12')
+  }
+}
+
+def shard_run_test_Cortex_M_11_of_12() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
+        try {
+          init_git()
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=10',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Cortex-M 11 of 12')
+  }
+}
+
+def shard_run_test_Cortex_M_12_of_12() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-cortexm") {
+        try {
+          init_git()
+          docker_init(ci_cortexm)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=cortexm',
+              'TEST_STEP_NAME=test: Cortex-M',
+              'TVM_NUM_SHARDS=12',
+              'TVM_SHARD_INDEX=11',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cortexm/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_cortexm} ./tests/scripts/task_python_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_Cortex_M --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: Cortex-M 12 of 12')
   }
 }
 
 
+def shard_run_test_RISC_V_1_of_1() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/test-riscv") {
+        try {
+          init_git()
+          docker_init(ci_riscv)
+          timeout(time: max_time, unit: 'MINUTES') {
+            withEnv([
+              'PLATFORM=riscv',
+              'TEST_STEP_NAME=test: RISC-V',
+              'TVM_NUM_SHARDS=1',
+              'TVM_SHARD_INDEX=0',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
+              sh(
+                        script: """
+                          set -eux
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/riscv/build/libtvm.so build/libtvm.so
+                          md5sum build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/riscv/build/libtvm_runtime.so build/libtvm_runtime.so
+                          md5sum build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/riscv/build/config.cmake build/config.cmake
+                          md5sum build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/riscv/build/microtvm_template_projects build/microtvm_template_projects --recursive
+                        """,
+                        label: 'Download artifacts from S3',
+                      )
+
+              add_microtvm_permissions()
+              ci_setup(ci_riscv)
+              cpp_unittest(ci_cortexm)
+              sh (
+                script: "${docker_run} ${ci_riscv} ./tests/scripts/task_riscv_microtvm.sh",
+                label: 'Run microTVM tests',
+              )
+            })
+          }
+        } finally {
+          try {
+            sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/test_RISC_V --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+            junit 'build/pytest-results/*.xml'
+          } catch (Exception e) {
+            echo 'Exception during JUnit upload: ' + e.toString()
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('test: RISC-V 1 of 1')
+  }
+}
+
+
+def run_unittest_minimal() {
+  if (!skip_ci && is_docs_only_build != 1) {
+    node('CPU-SMALL') {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-cpu-minimal") {
+        timeout(time: max_time, unit: 'MINUTES') {
+          try {
+            init_git()
+            docker_init(ci_minimal)
+            withEnv(['PLATFORM=minimal'], {
+              sh(
+                    script: """
+                      set -eux
+                      . ci/scripts/retry.sh
+                      retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu-minimal/build/libtvm.so build/libtvm.so
+                      md5sum build/libtvm.so
+                      retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu-minimal/build/libtvm_runtime.so build/libtvm_runtime.so
+                      md5sum build/libtvm_runtime.so
+                      retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu-minimal/build/config.cmake build/config.cmake
+                      md5sum build/config.cmake
+                    """,
+                    label: 'Download artifacts from S3',
+                  )
+
+              cpp_unittest(ci_minimal)
+              python_unittest(ci_minimal)
+            })
+          } finally {
+            try {
+              sh(
+            script: """
+              set -eux
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/unittest_CPU_MINIMAL --recursive
+            """,
+            label: 'Upload JUnits to S3',
+          )
+
+              junit 'build/pytest-results/*.xml'
+            } catch (Exception e) {
+              echo 'Exception during JUnit upload: ' + e.toString()
+            }
+          }
+        }
+      }
+    }
+  } else {
+    Utils.markStageSkippedForConditional('unittest: CPU MINIMAL')
+  }
+}
 
 def test() {
 stage('Test') {
@@ -3225,59 +4098,50 @@ stage('Test') {
   'unittest: GPU 3 of 3': {
     shard_run_unittest_GPU_3_of_3()
   },
-  'integration: CPU 1 of 6': {
-    shard_run_integration_CPU_1_of_6()
+  'integration: CPU 1 of 4': {
+    shard_run_integration_CPU_1_of_4()
   },
-  'integration: CPU 2 of 6': {
-    shard_run_integration_CPU_2_of_6()
+  'integration: CPU 2 of 4': {
+    shard_run_integration_CPU_2_of_4()
   },
-  'integration: CPU 3 of 6': {
-    shard_run_integration_CPU_3_of_6()
+  'integration: CPU 3 of 4': {
+    shard_run_integration_CPU_3_of_4()
   },
-  'integration: CPU 4 of 6': {
-    shard_run_integration_CPU_4_of_6()
+  'integration: CPU 4 of 4': {
+    shard_run_integration_CPU_4_of_4()
   },
-  'integration: CPU 5 of 6': {
-    shard_run_integration_CPU_5_of_6()
+  'python: i386 1 of 3': {
+    shard_run_python_i386_1_of_3()
   },
-  'integration: CPU 6 of 6': {
-    shard_run_integration_CPU_6_of_6()
+  'python: i386 2 of 3': {
+    shard_run_python_i386_2_of_3()
   },
-  'python: i386 1 of 5': {
-    shard_run_python_i386_1_of_5()
+  'python: i386 3 of 3': {
+    shard_run_python_i386_3_of_3()
   },
-  'python: i386 2 of 5': {
-    shard_run_python_i386_2_of_5()
+  'test: Hexagon 1 of 8': {
+    shard_run_test_Hexagon_1_of_8()
   },
-  'python: i386 3 of 5': {
-    shard_run_python_i386_3_of_5()
+  'test: Hexagon 2 of 8': {
+    shard_run_test_Hexagon_2_of_8()
   },
-  'python: i386 4 of 5': {
-    shard_run_python_i386_4_of_5()
+  'test: Hexagon 3 of 8': {
+    shard_run_test_Hexagon_3_of_8()
   },
-  'python: i386 5 of 5': {
-    shard_run_python_i386_5_of_5()
+  'test: Hexagon 4 of 8': {
+    shard_run_test_Hexagon_4_of_8()
   },
-  'test: Hexagon 1 of 7': {
-    shard_run_test_Hexagon_1_of_7()
+  'test: Hexagon 5 of 8': {
+    shard_run_test_Hexagon_5_of_8()
   },
-  'test: Hexagon 2 of 7': {
-    shard_run_test_Hexagon_2_of_7()
+  'test: Hexagon 6 of 8': {
+    shard_run_test_Hexagon_6_of_8()
   },
-  'test: Hexagon 3 of 7': {
-    shard_run_test_Hexagon_3_of_7()
+  'test: Hexagon 7 of 8': {
+    shard_run_test_Hexagon_7_of_8()
   },
-  'test: Hexagon 4 of 7': {
-    shard_run_test_Hexagon_4_of_7()
-  },
-  'test: Hexagon 5 of 7': {
-    shard_run_test_Hexagon_5_of_7()
-  },
-  'test: Hexagon 6 of 7': {
-    shard_run_test_Hexagon_6_of_7()
-  },
-  'test: Hexagon 7 of 7': {
-    shard_run_test_Hexagon_7_of_7()
+  'test: Hexagon 8 of 8': {
+    shard_run_test_Hexagon_8_of_8()
   },
   'integration: aarch64 1 of 4': {
     shard_run_integration_aarch64_1_of_4()
@@ -3291,17 +4155,14 @@ stage('Test') {
   'integration: aarch64 4 of 4': {
     shard_run_integration_aarch64_4_of_4()
   },
-  'topi: GPU 1 of 4': {
-    shard_run_topi_GPU_1_of_4()
+  'topi: GPU 1 of 3': {
+    shard_run_topi_GPU_1_of_3()
   },
-  'topi: GPU 2 of 4': {
-    shard_run_topi_GPU_2_of_4()
+  'topi: GPU 2 of 3': {
+    shard_run_topi_GPU_2_of_3()
   },
-  'topi: GPU 3 of 4': {
-    shard_run_topi_GPU_3_of_4()
-  },
-  'topi: GPU 4 of 4': {
-    shard_run_topi_GPU_4_of_4()
+  'topi: GPU 3 of 3': {
+    shard_run_topi_GPU_3_of_3()
   },
   'frontend: GPU 1 of 6': {
     shard_run_frontend_GPU_1_of_6()
@@ -3333,17 +4194,47 @@ stage('Test') {
   'frontend: aarch64 2 of 2': {
     shard_run_frontend_aarch64_2_of_2()
   },
-  'test: Qemu 1 of 4': {
-    shard_run_test_Qemu_1_of_4()
+  'test: Cortex-M 1 of 12': {
+    shard_run_test_Cortex_M_1_of_12()
   },
-  'test: Qemu 2 of 4': {
-    shard_run_test_Qemu_2_of_4()
+  'test: Cortex-M 2 of 12': {
+    shard_run_test_Cortex_M_2_of_12()
   },
-  'test: Qemu 3 of 4': {
-    shard_run_test_Qemu_3_of_4()
+  'test: Cortex-M 3 of 12': {
+    shard_run_test_Cortex_M_3_of_12()
   },
-  'test: Qemu 4 of 4': {
-    shard_run_test_Qemu_4_of_4()
+  'test: Cortex-M 4 of 12': {
+    shard_run_test_Cortex_M_4_of_12()
+  },
+  'test: Cortex-M 5 of 12': {
+    shard_run_test_Cortex_M_5_of_12()
+  },
+  'test: Cortex-M 6 of 12': {
+    shard_run_test_Cortex_M_6_of_12()
+  },
+  'test: Cortex-M 7 of 12': {
+    shard_run_test_Cortex_M_7_of_12()
+  },
+  'test: Cortex-M 8 of 12': {
+    shard_run_test_Cortex_M_8_of_12()
+  },
+  'test: Cortex-M 9 of 12': {
+    shard_run_test_Cortex_M_9_of_12()
+  },
+  'test: Cortex-M 10 of 12': {
+    shard_run_test_Cortex_M_10_of_12()
+  },
+  'test: Cortex-M 11 of 12': {
+    shard_run_test_Cortex_M_11_of_12()
+  },
+  'test: Cortex-M 12 of 12': {
+    shard_run_test_Cortex_M_12_of_12()
+  },
+  'test: RISC-V 1 of 1': {
+    shard_run_test_RISC_V_1_of_1()
+  },
+  'unittest: CPU MINIMAL': {
+    run_unittest_minimal()
   },
   'unittest: CPU': {
     if (!skip_ci && is_docs_only_build != 1) {
@@ -3351,21 +4242,24 @@ stage('Test') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-cpu") {
           timeout(time: max_time, unit: 'MINUTES') {
             try {
-              docker_init(ci_cpu)
               init_git()
-              withEnv(['PLATFORM=cpu'], {
+              docker_init(ci_cpu)
+              withEnv(['PLATFORM=cpu',
+              'TEST_STEP_NAME=unittest: CPU',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
                 sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_tsim.so build/libvta_tsim.so
                           md5sum build/libvta_tsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -3381,15 +4275,20 @@ stage('Test') {
                 )
               })
             } finally {
+            try {
               sh(
                 script: """
                   set -eux
-                  aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+                  . ci/scripts/retry.sh
+                  retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/unittest_CPU --recursive
                 """,
                 label: 'Upload JUnits to S3',
               )
 
               junit 'build/pytest-results/*.xml'
+            } catch (Exception e) {
+              echo 'Exception during JUnit upload: ' + e.toString()
+            }
             }
           }
         }
@@ -3404,19 +4303,22 @@ stage('Test') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/frontend-python-cpu") {
           timeout(time: max_time, unit: 'MINUTES') {
             try {
-              docker_init(ci_cpu)
               init_git()
-              withEnv(['PLATFORM=cpu'], {
+              docker_init(ci_cpu)
+              withEnv(['PLATFORM=cpu',
+              'TEST_STEP_NAME=frontend: CPU',
+              "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
                 sh(
                         script: """
                           set -eux
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
+                          . ci/scripts/retry.sh
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm.so build/libtvm.so
                           md5sum build/libtvm.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libvta_fsim.so build/libvta_fsim.so
                           md5sum build/libvta_fsim.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/libtvm_runtime.so build/libtvm_runtime.so
                           md5sum build/libtvm_runtime.so
-                          aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
+                          retry 3 aws s3 cp --no-progress s3://${s3_prefix}/cpu/build/config.cmake build/config.cmake
                           md5sum build/config.cmake
                         """,
                         label: 'Download artifacts from S3',
@@ -3429,15 +4331,20 @@ stage('Test') {
                 )
               })
             } finally {
+            try {
               sh(
                 script: """
                   set -eux
-                  aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results --recursive
+                  . ci/scripts/retry.sh
+                  retry 3 aws s3 cp --no-progress build/pytest-results s3://${s3_prefix}/pytest-results/frontend_CPU --recursive
                 """,
                 label: 'Upload JUnits to S3',
               )
 
               junit 'build/pytest-results/*.xml'
+            } catch (Exception e) {
+              echo 'Exception during JUnit upload: ' + e.toString()
+            }
             }
           }
         }
@@ -3450,20 +4357,21 @@ stage('Test') {
     if (!skip_ci) {
       node('GPU') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/docs-python-gpu") {
-          docker_init(ci_gpu)
           init_git()
+          docker_init(ci_gpu)
           sh(
             script: """
               set -eux
-              aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
+              . ci/scripts/retry.sh
+              retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm.so build/libtvm.so
               md5sum build/libtvm.so
-              aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
+              retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libvta_fsim.so build/libvta_fsim.so
               md5sum build/libvta_fsim.so
-              aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
+              retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/libtvm_runtime.so build/libtvm_runtime.so
               md5sum build/libtvm_runtime.so
-              aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
+              retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/config.cmake build/config.cmake
               md5sum build/config.cmake
-              aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/microtvm_template_projects build/microtvm_template_projects --recursive
+              retry 3 aws s3 cp --no-progress s3://${s3_prefix}/gpu/build/microtvm_template_projects build/microtvm_template_projects --recursive
             """,
             label: 'Download artifacts from S3',
           )
@@ -3477,13 +4385,14 @@ stage('Test') {
             )
           }
           sh(
-            script: """
-              set -eux
-              md5sum docs.tgz
-              aws s3 cp --no-progress docs.tgz s3://${s3_prefix}/docs/docs.tgz
-            """,
-            label: 'Upload artifacts to S3',
-          )
+      script: """
+        set -eux
+        . ci/scripts/retry.sh
+        md5sum docs.tgz
+        retry 3 aws s3 cp --no-progress docs.tgz s3://${s3_prefix}/docs/docs.tgz
+      """,
+      label: 'Upload artifacts to S3',
+    )
 
           sh(
             script: "aws s3 cp --no-progress _docs s3://${s3_prefix}/docs --recursive",
@@ -3495,7 +4404,8 @@ stage('Test') {
   },
   )
 }
-}/*
+}
+/*
 stage('Build packages') {
   parallel 'conda CPU': {
     node('CPU') {
@@ -3515,18 +4425,23 @@ stage('Build packages') {
 
 
 def update_docker(ecr_image, hub_image) {
+  if (ecr_image == null) {
+    sh("image was not rebuilt, skipping")
+    return
+  }
   if (!ecr_image.contains("amazonaws.com")) {
-    sh("echo Skipping '${ecr_image}' since it doesn't look like an ECR image")
+    sh("echo \"Skipping '${ecr_image}' -> '${hub_image}' since it doesn\'t look like an ECR image\"")
     return
   }
   docker_init(ecr_image)
   sh(
     script: """
     set -eux
+    . ci/scripts/retry.sh
     docker tag \
       ${ecr_image} \
       ${hub_image}
-    docker push ${hub_image}
+    retry 5 docker push ${hub_image}
     """,
     label: "Update ${hub_image} on Docker Hub",
   )
@@ -3565,7 +4480,7 @@ def deploy_docs() {
       script: '''
         cd tvm-site
         git remote add deploy https://$GITHUB_TOKEN:x-oauth-basic@github.com/apache/tvm-site.git
-        git push deploy $DOCS_DEPLOY_BRANCH
+        git push deploy $DOCS_DEPLOY_BRANCH || true
       ''',
       label: 'Upload docs to apache/tvm-site'
     )
@@ -3575,57 +4490,247 @@ def deploy_docs() {
 
 def deploy() {
   stage('Deploy') {
-    if (env.BRANCH_NAME == 'main' && env.DOCS_DEPLOY_ENABLED == 'yes') {
+    if (env.BRANCH_NAME == 'main') {
+      parallel(
+  'Deploy Docs': {
+    if (env.DOCS_DEPLOY_ENABLED == 'yes') {
       node('CPU') {
         ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/deploy-docs") {
-          sh(
-            script: """
-              set -eux
-              aws s3 cp --no-progress s3://${s3_prefix}/docs/docs.tgz docs.tgz
-              md5sum docs.tgz
-            """,
-            label: 'Download artifacts from S3',
-          )
+          timeout(time: max_time, unit: 'MINUTES') {
+            init_git()
+                    sh(
+                      script: """
+                        set -eux
+                        . ci/scripts/retry.sh
+                        retry 3 aws s3 cp --no-progress s3://${s3_prefix}/docs/docs.tgz docs.tgz
+                        md5sum docs.tgz
+                      """,
+                      label: 'Download artifacts from S3',
+                    )
 
-          deploy_docs()
-        }
-      }
-    }
-    if (env.BRANCH_NAME == 'main' && env.DEPLOY_DOCKER_IMAGES == 'yes' && rebuild_docker_images && upstream_revision != null) {
-      node('CPU') {
-        ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/deploy-docker") {
-          try {
-            withCredentials([string(
-              credentialsId: 'dockerhub-tlcpackstaging-key',
-              variable: 'DOCKERHUB_KEY',
-            )]) {
-              sh(
-                script: 'docker login -u tlcpackstaging -p ${DOCKERHUB_KEY}',
-                label: 'Log in to Docker Hub',
-              )
-            }
-            def date_Ymd_HMS = sh(
-              script: 'python3 -c \'import datetime; print(datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))\'',
-              label: 'Determine date',
-              returnStdout: true,
-            ).trim()
-            def tag = "${date_Ymd_HMS}-${upstream_revision.substring(0, 8)}"
-            update_docker(ci_arm, "tlcpackstaging/ci_arm:${tag}")
-            update_docker(ci_cpu, "tlcpackstaging/ci_cpu:${tag}")
-            update_docker(ci_gpu, "tlcpackstaging/ci_gpu:${tag}")
-            update_docker(ci_hexagon, "tlcpackstaging/ci_hexagon:${tag}")
-            update_docker(ci_i386, "tlcpackstaging/ci_i386:${tag}")
-            update_docker(ci_lint, "tlcpackstaging/ci_lint:${tag}")
-            update_docker(ci_qemu, "tlcpackstaging/ci_qemu:${tag}")
-            update_docker(ci_wasm, "tlcpackstaging/ci_wasm:${tag}")
-          } finally {
-            sh(
-              script: 'docker logout',
-              label: 'Clean up login credentials'
-            )
+                    deploy_docs()
           }
         }
       }
+    } else {
+      Utils.markStageSkippedForConditional('Deploy Docs')
+    }
+  },
+  'Upload built Docker images': {
+    if (env.DEPLOY_DOCKER_IMAGES == 'yes' && rebuild_docker_images && upstream_revision != null) {
+      node('CPU') {
+        ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/deploy-docker") {
+          timeout(time: max_time, unit: 'MINUTES') {
+            init_git()
+                    try {
+                      withCredentials([string(
+                        credentialsId: 'dockerhub-tlcpackstaging-key',
+                        variable: 'DOCKERHUB_KEY',
+                      )]) {
+                        sh(
+                          script: 'docker login -u tlcpackstaging -p ${DOCKERHUB_KEY}',
+                          label: 'Log in to Docker Hub',
+                        )
+                      }
+                      def date_Ymd_HMS = sh(
+                        script: 'python3 -c \'import datetime; print(datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))\'',
+                        label: 'Determine date',
+                        returnStdout: true,
+                      ).trim()
+                      def tag = "${date_Ymd_HMS}-${upstream_revision.substring(0, 8)}"
+                      update_docker(built_ci_arm, "tlcpackstaging/ci_arm:${tag}")
+                      update_docker(built_ci_cortexm, "tlcpackstaging/ci_cortexm:${tag}")
+                      update_docker(built_ci_cpu, "tlcpackstaging/ci_cpu:${tag}")
+                      update_docker(built_ci_gpu, "tlcpackstaging/ci_gpu:${tag}")
+                      update_docker(built_ci_hexagon, "tlcpackstaging/ci_hexagon:${tag}")
+                      update_docker(built_ci_i386, "tlcpackstaging/ci_i386:${tag}")
+                      update_docker(built_ci_lint, "tlcpackstaging/ci_lint:${tag}")
+                      update_docker(built_ci_minimal, "tlcpackstaging/ci_minimal:${tag}")
+                      update_docker(built_ci_riscv, "tlcpackstaging/ci_riscv:${tag}")
+                      update_docker(built_ci_wasm, "tlcpackstaging/ci_wasm:${tag}")
+                    } finally {
+                      sh(
+                        script: 'docker logout',
+                        label: 'Clean up login credentials'
+                      )
+                    }
+          }
+        }
+      }
+    } else {
+      Utils.markStageSkippedForConditional('Upload built Docker images')
+    }
+  },
+  'Tag tlcpackstaging to tlcpack': {
+    if (env.DOCS_DEPLOY_ENABLED == 'yes') {
+      node('CPU') {
+        ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/tag-images") {
+          timeout(time: max_time, unit: 'MINUTES') {
+            init_git()
+                    withCredentials([string(
+                      credentialsId: 'dockerhub-tlcpack-key',
+                      variable: 'TLCPACK_TOKEN',
+                    )]) {
+                      try {
+                        sh(
+                          script: 'echo $TLCPACK_TOKEN | docker login --username octomldriazati --password-stdin',
+                          label: 'Log in to Docker Hub'
+                        )
+                        if (ci_arm.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_arm.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_arm:${tag}
+                              docker tag tlcpackstaging/ci_arm:${tag} tlcpack/ci-arm:${tag}
+                              retry 5 docker push tlcpack/ci-arm:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_arm image to tlcpack',
+                          )
+                        }
+                        if (ci_cortexm.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_cortexm.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_cortexm:${tag}
+                              docker tag tlcpackstaging/ci_cortexm:${tag} tlcpack/ci-cortexm:${tag}
+                              retry 5 docker push tlcpack/ci-cortexm:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_cortexm image to tlcpack',
+                          )
+                        }
+                        if (ci_cpu.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_cpu.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_cpu:${tag}
+                              docker tag tlcpackstaging/ci_cpu:${tag} tlcpack/ci-cpu:${tag}
+                              retry 5 docker push tlcpack/ci-cpu:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_cpu image to tlcpack',
+                          )
+                        }
+                        if (ci_gpu.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_gpu.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_gpu:${tag}
+                              docker tag tlcpackstaging/ci_gpu:${tag} tlcpack/ci-gpu:${tag}
+                              retry 5 docker push tlcpack/ci-gpu:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_gpu image to tlcpack',
+                          )
+                        }
+                        if (ci_hexagon.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_hexagon.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_hexagon:${tag}
+                              docker tag tlcpackstaging/ci_hexagon:${tag} tlcpack/ci-hexagon:${tag}
+                              retry 5 docker push tlcpack/ci-hexagon:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_hexagon image to tlcpack',
+                          )
+                        }
+                        if (ci_i386.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_i386.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_i386:${tag}
+                              docker tag tlcpackstaging/ci_i386:${tag} tlcpack/ci-i386:${tag}
+                              retry 5 docker push tlcpack/ci-i386:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_i386 image to tlcpack',
+                          )
+                        }
+                        if (ci_lint.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_lint.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_lint:${tag}
+                              docker tag tlcpackstaging/ci_lint:${tag} tlcpack/ci-lint:${tag}
+                              retry 5 docker push tlcpack/ci-lint:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_lint image to tlcpack',
+                          )
+                        }
+                        if (ci_minimal.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_minimal.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_minimal:${tag}
+                              docker tag tlcpackstaging/ci_minimal:${tag} tlcpack/ci-minimal:${tag}
+                              retry 5 docker push tlcpack/ci-minimal:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_minimal image to tlcpack',
+                          )
+                        }
+                        if (ci_riscv.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_riscv.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_riscv:${tag}
+                              docker tag tlcpackstaging/ci_riscv:${tag} tlcpack/ci-riscv:${tag}
+                              retry 5 docker push tlcpack/ci-riscv:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_riscv image to tlcpack',
+                          )
+                        }
+                        if (ci_wasm.contains("tlcpackstaging")) {
+                          // Push image to tlcpack
+                          def tag = ci_wasm.split(":")[1]
+                          sh(
+                            script: """
+                              set -eux
+                              . ci/scripts/retry.sh
+                              docker pull tlcpackstaging/ci_wasm:${tag}
+                              docker tag tlcpackstaging/ci_wasm:${tag} tlcpack/ci-wasm:${tag}
+                              retry 5 docker push tlcpack/ci-wasm:${tag}
+                            """,
+                            label: 'Tag tlcpackstaging/ci_wasm image to tlcpack',
+                          )
+                        }
+                      } finally {
+                        sh(
+                          script: 'docker logout',
+                          label: 'Clean up login credentials'
+                        )
+                      }
+                    }
+          }
+        }
+      }
+    } else {
+      Utils.markStageSkippedForConditional('Tag tlcpackstaging to tlcpack')
+    }
+  },
+      )
     }
   }
 }

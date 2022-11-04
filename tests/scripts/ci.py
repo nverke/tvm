@@ -147,7 +147,14 @@ def gen_name(s: str) -> str:
     return f"{s}-{suffix}"
 
 
-def docker(name: str, image: str, scripts: List[str], env: Dict[str, str], interactive: bool):
+def docker(
+    name: str,
+    image: str,
+    scripts: List[str],
+    env: Dict[str, str],
+    interactive: bool,
+    additional_flags: Optional[Dict[str, str]] = None,
+):
     """
     Invoke a set of bash scripts through docker/bash.sh
 
@@ -165,9 +172,11 @@ def docker(name: str, image: str, scripts: List[str], env: Dict[str, str], inter
         "ci_cpu",
         # "ci_wasm",
         # "ci_i386",
-        "ci_qemu",
+        "ci_cortexm",
         "ci_arm",
         "ci_hexagon",
+        "ci_riscv",
+        "ci_adreno",
     }
 
     if image in sccache_images and os.getenv("USE_SCCACHE", "1") == "1":
@@ -194,6 +203,11 @@ def docker(name: str, image: str, scripts: List[str], env: Dict[str, str], inter
     for key, value in env.items():
         command.append("--env")
         command.append(f"{key}={value}")
+
+    if additional_flags is not None:
+        for key, value in additional_flags.items():
+            command.append(key)
+            command.append(value)
 
     SCRIPT_DIR.mkdir(exist_ok=True)
 
@@ -344,6 +358,7 @@ def generate_command(
     help: str,
     precheck: Optional[Callable[[], None]] = None,
     post_build: Optional[List[str]] = None,
+    additional_flags: Optional[Dict[str, str]] = None,
 ):
     """
     Helper to generate CLIs that:
@@ -410,6 +425,7 @@ def generate_command(
                 "VERBOSE": "true" if verbose else "false",
             },
             interactive=interactive,
+            additional_flags=additional_flags,
         )
 
     fn.__name__ = name
@@ -596,6 +612,19 @@ generated = [
         },
     ),
     generate_command(
+        name="minimal",
+        help="Run minimal CPU build and test(s)",
+        options={
+            "cpp": CPP_UNITTEST,
+            "unittest": (
+                "run unit tests",
+                [
+                    "./tests/scripts/task_python_unittest.sh",
+                ],
+            ),
+        },
+    ),
+    generate_command(
         name="i386",
         help="Run i386 build and test(s)",
         options={
@@ -618,8 +647,8 @@ generated = [
         },
     ),
     generate_command(
-        name="qemu",
-        help="Run QEMU build and test(s)",
+        name="cortexm",
+        help="Run Cortex-M build and test(s)",
         options={
             "cpp": CPP_UNITTEST,
             "test": (
@@ -656,6 +685,37 @@ generated = [
                 [
                     "./tests/scripts/task_python_unittest.sh",
                     "./tests/scripts/task_python_arm_compute_library.sh",
+                ],
+            ),
+        },
+    ),
+    generate_command(
+        name="riscv",
+        help="Run RISC-V build and test(s)",
+        options={
+            "cpp": CPP_UNITTEST,
+            "python": (
+                "run full Python tests",
+                [
+                    "./tests/scripts/task_riscv_microtvm.sh",
+                ],
+            ),
+        },
+    ),
+    generate_command(
+        name="adreno",
+        help="Run Adreno build and test(s)",
+        post_build=["./tests/scripts/task_build_adreno_bins.sh"],
+        additional_flags={
+            "--volume": os.environ.get("ADRENO_OPENCL", "") + ":/adreno-opencl",
+            "--env": "ADRENO_OPENCL=/adreno-opencl",
+            "--net": "host",
+        },
+        options={
+            "test": (
+                "run Adreno API/Python tests",
+                [
+                    "./tests/scripts/task_python_adreno.sh " + os.environ.get("ANDROID_SERIAL", ""),
                 ],
             ),
         },

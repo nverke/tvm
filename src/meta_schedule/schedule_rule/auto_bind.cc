@@ -45,7 +45,7 @@ void BindBlockThreadIdx(const tir::Schedule& sch, const tir::BlockRV& block_rv,
   int i_spatial_loop = -1;
   for (int i = 0; i < n; ++i) {
     const StmtSRef& loop_sref = loops[i];
-    const ForNode* loop = TVM_SREF_TO_FOR(loop, loop_sref);
+    const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
     runtime::ThreadScope thread_scope = GetThreadScope(loop);
     if (IsBlockIdx(thread_scope)) {
       if (i_block_idx == -1) {
@@ -177,6 +177,12 @@ class AutoBindNode : public ScheduleRuleNode {
   // Inherited from ScheduleRuleNode
   Array<tir::Schedule> Apply(const tir::Schedule& sch, const tir::BlockRV& block_rv) final;
 
+  // Inherited from ScheduleRuleNode
+  ScheduleRule Clone() const final {
+    ObjectPtr<AutoBindNode> n = make_object<AutoBindNode>(*this);
+    return ScheduleRule(n);
+  }
+
  public:
   /*! \brief The max number of threads per block from Target */
   int64_t max_threads_per_block_ = -1;
@@ -202,10 +208,11 @@ Array<tir::Schedule> AutoBindNode::Apply(const tir::Schedule& sch, const tir::Bl
   return {sch};
 }
 
-ScheduleRule ScheduleRule::AutoBind(int max_threadblocks, Array<Integer> thread_extents) {
+ScheduleRule ScheduleRule::AutoBind(int max_threadblocks, Array<Integer> thread_extents,
+                                    int max_threads_per_block) {
   ObjectPtr<AutoBindNode> n = make_object<AutoBindNode>();
   n->max_threadblocks_ = max_threadblocks;
-  n->max_threads_per_block_ = -1;
+  n->max_threads_per_block_ = max_threads_per_block;
   n->thread_extents_ = std::move(thread_extents);
   return ScheduleRule(n);
 }

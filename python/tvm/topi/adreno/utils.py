@@ -20,6 +20,7 @@
 import tvm
 import numpy
 from tvm import te
+from tvm._ffi.registry import register_func
 from tvm.topi.utils import simplify
 from tvm.topi import nn
 from tvm.autotvm.task.space import SplitEntity
@@ -474,7 +475,19 @@ def add_pad(
         pad_after[x_axis] -= in_width + pad_before[x_axis] + pad_after[x_axis] - input_latest_w
     if input_latest_h < in_height + pad_before[y_axis] + pad_after[y_axis]:
         pad_after[y_axis] -= in_height + pad_before[y_axis] + pad_after[y_axis] - input_latest_h
-    return nn.pad(data, pad_before, pad_after, name="pad_temp")
+    if (
+        pad_before[0] == 0
+        and pad_before[1] == 0
+        and pad_before[2] == 0
+        and pad_before[3] == 0
+        and pad_after[0] == 0
+        and pad_after[1] == 0
+        and pad_after[2] == 0
+        and pad_after[3] == 0
+    ):
+        return data
+    else:
+        return nn.pad(data, pad_before, pad_after, name="pad_temp")
 
 
 def bind_data_copy(stage, axis_to_vectorize=None):
@@ -512,19 +525,27 @@ def bind_data_copy(stage, axis_to_vectorize=None):
         stage.bind(block, te.thread_axis("blockIdx.z"))
         stage.bind(thread, te.thread_axis("threadIdx.z"))
     else:
-        axes = stage.op.axis
-        fused = stage.fuse(*axes[:-1])
-        if shape[-1] <= 32:
+        if shape[-1] == 4:
+            axes = stage.op.axis
+            fused = stage.fuse(*axes[:-1])
             ftc = numpy.prod(shape[:-1])
             div = get_div(ftc, 64)
             block, thread = stage.split(fused, factor=div)
             stage.bind(block, te.thread_axis("blockIdx.x"))
             stage.bind(thread, te.thread_axis("threadIdx.x"))
-            if shape[-1] == 4:
-                stage.vectorize(axes[-1])
+            stage.vectorize(axes[-1])
         else:
-            stage.bind(fused, te.thread_axis("blockIdx.x"))
-            stage.bind(*axes[-1:], te.thread_axis("threadIdx.x"))
+            ftc = numpy.prod(shape)
+            vthread = get_div(ftc, 8)
+            fused = stage.fuse(*stage.op.axis)
+            ftc = ftc / vthread
+            # 1024 is a maximum work group size on the most Adreno GPU
+            num_thread = get_div(ftc, 1024 // vthread)
+            a, b = stage.split(fused, factor=num_thread)
+            a, c = stage.split(a, factor=vthread)
+            stage.bind(c, te.thread_axis("vthread"))
+            stage.bind(a, te.thread_axis("blockIdx.x"))
+            stage.bind(b, te.thread_axis("threadIdx.x"))
 
 
 def get_texture_storage(shape):
@@ -548,6 +569,19 @@ def get_texture_storage(shape):
         return "global.texture-nhwc"
     else:
         return "global.texture-weight"
+
+
+@register_func("tvm.info.mem.global.texture")
+@register_func("tvm.info.mem.global.texture-nhwc")
+@register_func("tvm.info.mem.global.texture-weight")
+def mem_info_global_texture_variants():
+    return tvm.ir.make_node(
+        "MemoryInfo",
+        unit_bits=16,
+        max_num_bits=16384 * 16384 * 4 * 32,
+        max_simd_bits=4 * 32,
+        head_address=None,
+    )
 
 
 def infer_tile_size(data, layout):

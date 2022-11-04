@@ -29,8 +29,6 @@ from tvm.target import Target
 from tvm.topi.nn.qnn import SQNN_DTYPE_TO_CODE
 from tvm.topi.x86.utils import target_has_sse41
 
-from ... import op as reg
-from ...op import OpPattern
 from . import _make, _requantize
 
 
@@ -963,6 +961,44 @@ def erf(x, scale, zero_point, output_scale, output_zero_point):
     )
 
 
+# pylint: disable=redefined-builtin
+
+
+def abs(x, scale, zero_point, output_scale, output_zero_point):
+    """Quantized abs function.
+
+    Parameters
+    ----------
+    x : relay.Expr
+        The quantized input tensor.
+
+    scale: relay.Expr
+        The scale of the quantized expr.
+
+    zero_point: relay.Expr
+       The zero point of quantized expr.
+
+    output_scale: relay.Expr
+        The scale of the output quantized expr.
+
+    output_zero_point: relay.Expr
+       The zero point of output quantized expr.
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+
+    """
+    return _make.abs(
+        x,
+        scale,
+        zero_point,
+        output_scale,
+        output_zero_point,
+    )
+
+
 def sigmoid(x, scale, zero_point, output_scale, output_zero_point):
     """Quantized sigmoid.
 
@@ -1172,11 +1208,6 @@ def batch_matmul(x, y, x_zero_point, y_zero_point, x_scale, y_scale, out_dtype="
         The computed result.
     """
     return _make.batch_matmul(x, y, x_zero_point, y_zero_point, x_scale, y_scale, out_dtype)
-
-
-# register fuse pattern for qnn ops
-reg.register_pattern("qnn.quantize", OpPattern.OPAQUE)
-reg.register_pattern("qnn.dequantize", OpPattern.OPAQUE)
 
 
 def leaky_relu(x, alpha, input_scale, input_zero_point, output_scale, output_zero_point):

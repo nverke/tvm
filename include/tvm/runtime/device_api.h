@@ -52,10 +52,10 @@ enum DeviceAttrKind : int {
 };
 
 /*! \brief Number of bytes each allocation must align to */
-constexpr int kAllocAlignment = 128;
+constexpr int kAllocAlignment = 64;
 
 /*! \brief Number of bytes each allocation must align to in temporary allocation */
-constexpr int kTempAllocaAlignment = 128;
+constexpr int kTempAllocaAlignment = 64;
 
 /*! \brief Maximum size that can be allocated on stack */
 constexpr int kMaxStackAlloca = 1024;
@@ -234,6 +234,7 @@ class TVM_DLL DeviceAPI {
 
 /*! \brief The device type bigger than this is RPC device */
 constexpr int kRPCSessMask = 128;
+static_assert(kRPCSessMask >= TVMDeviceExtType_End);
 
 /*!
  * \brief The name of Device API factory.
@@ -248,6 +249,8 @@ inline const char* DeviceName(int type) {
       return "cuda";
     case kDLCUDAHost:
       return "cuda_host";
+    case kDLCUDAManaged:
+      return "cuda_managed";
     case kDLOpenCL:
       return "opencl";
     case kDLSDAccel:
@@ -262,12 +265,20 @@ inline const char* DeviceName(int type) {
       return "vpi";
     case kDLROCM:
       return "rocm";
+    case kDLROCMHost:
+      return "rocm_host";
     case kDLExtDev:
       return "ext_dev";
+    case kDLOneAPI:
+      return "oneapi";
     case kDLWebGPU:
       return "webgpu";
     case kDLHexagon:
       return "hexagon";
+    case kOpenGL:
+      return "opengl";
+    case kDLMicroDev:
+      return "microdev";
     default:
       LOG(FATAL) << "unknown type =" << type;
       return "Unknown";

@@ -31,6 +31,7 @@
 
 #include <unordered_map>
 
+#include "../../arith/const_fold.h"
 #include "ir_utils.h"
 
 namespace tvm {
@@ -68,8 +69,8 @@ class NoOpRemover : public StmtMutator {
   Stmt VisitStmt_(const IfThenElseNode* op) final {
     Stmt stmt = StmtMutator::VisitStmt_(op);
     op = stmt.as<IfThenElseNode>();
-    if (op->else_case.defined()) {
-      if (is_no_op(op->else_case)) {
+    if (op->else_case) {
+      if (is_no_op(op->else_case.value())) {
         if (is_no_op(op->then_case)) {
           return MakeEvaluate(op->condition);
         } else {
@@ -87,7 +88,14 @@ class NoOpRemover : public StmtMutator {
     }
   }
   Stmt VisitStmt_(const ForNode* op) final {
+    var_range_map_[op->loop_var.get()] = arith::IntSet::FromMinExtent(op->min, op->extent);
+    auto extent_range = arith::EvalSet(op->extent, var_range_map_);
+    if (!arith::is_neg_inf(extent_range.max()) && !arith::is_pos_inf(extent_range.max()) &&
+        analyzer_.CanProve(extent_range.max() <= 0)) {
+      return Evaluate(0);
+    }
     Stmt stmt = StmtMutator::VisitStmt_(op);
+    var_range_map_.erase(op->loop_var.get());
     op = stmt.as<ForNode>();
     if (is_zero(op->extent)) {
       return Evaluate(0);
@@ -162,6 +170,9 @@ class NoOpRemover : public StmtMutator {
     }
     return stmt.defined() ? stmt : Evaluate(0);
   }
+
+  std::unordered_map<const VarNode*, arith::IntSet> var_range_map_;
+  arith::Analyzer analyzer_;
 };
 
 Stmt RemoveNoOp(Stmt stmt) { return NoOpRemover()(std::move(stmt)); }
