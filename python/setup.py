@@ -110,6 +110,20 @@ def get_lib_path():
                             os.path.join(candidate_path, "libflash_attn", "cutlass", "media")
                         )
                     break
+        
+        # Add cutlass_fpA_intB_gemm
+        for name in lib_path:
+            candidate_path = os.path.abspath(os.path.join(os.path.dirname(name), "3rdparty/cutlass_fpA_intB_gemm"))
+            if os.path.isdir(candidate_path):
+                libs.append(candidate_path)
+                break
+        
+        # Add flash_attn
+        for name in lib_path:
+            candidate_path = os.path.abspath(os.path.join(os.path.dirname(name), "3rdparty/libflash_attn"))
+            if os.path.isdir(candidate_path):
+                libs.append(candidate_path)
+                break
     else:
         libs = None
 
